@@ -8,12 +8,17 @@ sources, requirements and their dependencies.
 
 from __future__ import absolute_import, print_function
 
+import json
 import os
+import re
+import shutil
 import sys
+from collections import OrderedDict
+from hashlib import sha1
 from optparse import OptionGroup, OptionParser, OptionValueError
 from textwrap import TextWrapper
 
-from pex.common import die, safe_delete, safe_mkdtemp
+from pex.common import die, safe_delete, safe_mkdir, safe_mkdtemp
 from pex.fetcher import Fetcher, PyPIFetcher
 from pex.interpreter import PythonInterpreter
 from pex.interpreter_constraints import validate_constraints
@@ -25,7 +30,9 @@ from pex.requirements import requirements_from_file
 from pex.resolvable import resolvables_from_iterable
 from pex.resolver import Unsatisfiable, resolve_multi
 from pex.resolver_options import ResolverOptionsBuilder
+from pex.third_party.pkg_resources import Requirement
 from pex.tracer import TRACER
+from pex.util import CacheHelper, DistributionHelper
 from pex.variables import ENV, Variables
 from pex.version import __version__
 
@@ -442,6 +449,14 @@ def configure_clp():
            'immediately and not save it to a file.')
 
   parser.add_option(
+    '--with-fingerprinted-inputs',
+    dest='fingerprinted_inputs',
+    default=None,
+    help='WARNING: EXPERIMENTAL!!! Path to an informally-specified JSON file containing hashes '
+         'for source and resource modules to read.',
+  )
+
+  parser.add_option(
       '-p', '--preamble-file',
       dest='preamble_file',
       metavar='FILE',
@@ -531,6 +546,155 @@ def _safe_link(src, dst):
   os.symlink(src, dst)
 
 
+def _walk_files(src_dir):
+  src_dir = os.path.normpath(src_dir)
+  for root, dirs, files in os.walk(src_dir):
+    for f in files:
+      yield os.path.join(root, f)
+
+
+def _walk_and_do(fn, src_dir):
+  for src_file_path in _walk_files(src_dir):
+    dst_path = os.path.relpath(src_file_path, src_dir)
+    fn(src_file_path, dst_path)
+
+
+def add_unchecked_sources(pex_builder, sources_directory, resources_directory):
+  for directory in sources_directory:
+    _walk_and_do(pex_builder.add_source, directory)
+
+  for directory in resources_directory:
+    _walk_and_do(pex_builder.add_resource, directory)
+
+
+def add_fingerprinted_sources(pex_builder, source_dir_hashes, resource_dir_hashes,
+                              sources_directory, resources_directory, component_cache_dir,
+                              verbosity):
+
+  def is_empty_fingerprint(fp):
+    return fp == '???'
+
+  def helper(maybe_fingerprinted_module_names, input_dirs, cache_subdir, add_source_fn):
+    for module_name, maybe_fingerprint in maybe_fingerprinted_module_names.items():
+      assert os.path.sep not in module_name, f'fingerprinted module name {module_name} should not contain "{os.path.sep}"!'
+      relpath_for_module = module_name.replace('.', os.path.sep)
+
+      def get_fingerprinted_cache_dir(fingerprint):
+        return os.path.join(component_cache_dir, cache_subdir, fingerprint)
+
+      if not is_empty_fingerprint(maybe_fingerprint):
+        prespecified_cache_dir = get_fingerprinted_cache_dir(maybe_fingerprint)
+        log(f'reading {module_name} from prespecified_cache_dir: {prespecified_cache_dir}',
+            V=verbosity)
+        if os.path.isdir(prespecified_cache_dir):
+          _walk_and_do(add_source_fn, prespecified_cache_dir)
+          continue
+
+      for directory in input_dirs:
+        full_dir_path = os.path.join(directory, relpath_for_module)
+        if os.path.isdir(full_dir_path):
+          dir_hash = CacheHelper.dir_hash(full_dir_path)
+          if is_empty_fingerprint(maybe_fingerprint):
+            maybe_fingerprinted_module_names[module_name] = dir_hash
+          else:
+            assert dir_hash == maybe_fingerprint, f'checksum for directory {full_dir_path} was wrong: expected hash should be {dir_hash}, was {maybe_fingerprint}!'
+          base_cache_dir = get_fingerprinted_cache_dir(dir_hash)
+          cache_dir = os.path.join(base_cache_dir, relpath_for_module)
+          if not os.path.isdir(cache_dir):
+            safe_mkdir(os.path.dirname(cache_dir))
+            shutil.copytree(full_dir_path, cache_dir)
+          log(f'reading {module_name} from cache_dir: {cache_dir}', V=verbosity)
+          _walk_and_do(add_source_fn, base_cache_dir)
+          break
+      else:
+        die(f'Failed to resolve {cache_subdir} module {module_name} with fingerprint {maybe_fingerprint}!')
+
+  with TRACER.timed('Resolving fingerprinted source modules'):
+    helper(source_dir_hashes, sources_directory, 'sources', pex_builder.add_source)
+  with TRACER.timed('Resolving fingerprinted resource modules'):
+    helper(resource_dir_hashes, resources_directory, 'resources', pex_builder.add_resource)
+
+  # NB: these may be *modified* if they were resolved from ??? -> a fingerprint when scanning
+  # source/resource directories!
+  return (source_dir_hashes, resource_dir_hashes)
+
+
+def add_unchecked_requirements(pex_builder, resolvables, interpreters, platforms, cache_dir,
+                               cache_ttl, prereleases_allowed, use_manylinux, verbosity):
+  with TRACER.timed('Resolving distributions'):
+    try:
+      resolveds = resolve_multi(resolvables,
+                                interpreters=interpreters,
+                                platforms=platforms,
+                                cache=cache_dir,
+                                cache_ttl=cache_ttl,
+                                allow_prereleases=prereleases_allowed,
+                                use_manylinux=use_manylinux)
+
+      for resolved_dist in resolveds:
+        log('  %s -> %s' % (resolved_dist.requirement, resolved_dist.distribution),
+            V=verbosity)
+        pex_builder.add_distribution(resolved_dist.distribution)
+        pex_builder.add_requirement(resolved_dist.requirement)
+    except Unsatisfiable as e:
+      die(e)
+
+
+def add_fingerprinted_requirements(pex_builder, component_cache_dir, resolvables, interpreters,
+                                   platforms, cache_dir, cache_ttl, prereleases_allowed,
+                                   use_manylinux, verbosity):
+  requirements_digest = sha1()
+  for resolvable in resolvables:
+    requirements_digest.update(str(resolvable).encode())
+  all_requirements_checksum = requirements_digest.hexdigest()
+
+  requirement_component_cache_dir = os.path.join(component_cache_dir,
+                                                 'requirements',
+                                                 all_requirements_checksum)
+
+  if not os.path.isdir(requirement_component_cache_dir):
+    with TRACER.timed('Resolving distributions and writing to fingerprinted cache'):
+      try:
+        resolveds = resolve_multi(resolvables,
+                                  interpreters=interpreters,
+                                  platforms=platforms,
+                                  cache=cache_dir,
+                                  cache_ttl=cache_ttl,
+                                  allow_prereleases=prereleases_allowed,
+                                  use_manylinux=use_manylinux)
+
+        safe_mkdir(requirement_component_cache_dir)
+        dist_requirement_mapping_file = os.path.join(requirement_component_cache_dir, '.mapping')
+        with open(dist_requirement_mapping_file, 'w') as mapping_file:
+          for resolved_dist in resolveds:
+            req = resolved_dist.requirement
+            dist = resolved_dist.distribution
+            dist_filename = os.path.basename(dist.location)
+            out_location = os.path.join(requirement_component_cache_dir, dist_filename)
+            # Copy the resolved dist to the cached location!
+            shutil.copyfile(dist.location, out_location)
+            # Write the dist and requirement out into the mapping file!
+            mapping_file.write(f'{req}&{dist_filename}\n')
+      except Unsatisfiable as e:
+        die(e)
+  assert os.path.isdir(requirement_component_cache_dir)
+
+  with TRACER.timed('Resolving requirements from fingerprinted cache'):
+    dist_requirement_mapping_file = os.path.join(requirement_component_cache_dir, '.mapping')
+    with open(dist_requirement_mapping_file, 'r') as mapping_file:
+      for entry in mapping_file:
+        req_str, _, dist_filename = tuple(re.sub(r'\n$', '', entry).partition('&'))
+        requirement = Requirement.parse(req_str)
+        full_dist_path = os.path.join(requirement_component_cache_dir, dist_filename)
+        assert os.path.isfile(full_dist_path), f'Requirement {requirement} was not found at specified path {full_dist_path}!'
+        dist = DistributionHelper.distribution_from_path(full_dist_path)
+        log('  %s -> %s' % (requirement, dist), V=verbosity)
+        pex_builder.add_distribution(dist)
+        pex_builder.add_requirement(requirement)
+
+  return all_requirements_checksum
+
+
 def build_pex(args, options, resolver_option_builder):
   with TRACER.timed('Resolving interpreters', V=2):
     def to_python_interpreter(full_path_or_basename):
@@ -570,19 +734,29 @@ def build_pex(args, options, resolver_option_builder):
 
   pex_builder = PEXBuilder(path=safe_mkdtemp(), interpreter=interpreter, preamble=preamble)
 
-  def walk_and_do(fn, src_dir):
-    src_dir = os.path.normpath(src_dir)
-    for root, dirs, files in os.walk(src_dir):
-      for f in files:
-        src_file_path = os.path.join(root, f)
-        dst_path = os.path.relpath(src_file_path, src_dir)
-        fn(src_file_path, dst_path)
+  component_cache_dir = os.path.join(options.cache_dir, 'components')
 
-  for directory in options.sources_directory:
-    walk_and_do(pex_builder.add_source, directory)
+  if options.fingerprinted_inputs is not None:
+    with open(options.fingerprinted_inputs, 'rb') as json_fingerprints:
+      fingerprinted_inputs = json.load(json_fingerprints)
+  else:
+    fingerprinted_inputs = None
 
-  for directory in options.resources_directory:
-    walk_and_do(pex_builder.add_resource, directory)
+  def into_ordered_dict(json_list_of_two_element_lists):
+    """Convert [[a, b], [c, d]] -> {a: b, c: d} (ordered)."""
+    return OrderedDict(tuple(entry) for entry in json_list_of_two_element_lists)
+
+  if fingerprinted_inputs:
+    source_dir_hashes, resource_dir_hashes = add_fingerprinted_sources(
+      pex_builder,
+      into_ordered_dict(fingerprinted_inputs['sources']),
+      into_ordered_dict(fingerprinted_inputs['resources']),
+      options.sources_directory,
+      options.resources_directory,
+      component_cache_dir,
+      options.verbosity)
+  else:
+    add_unchecked_sources(pex_builder, options.sources_directory, options.resources_directory)
 
   pex_info = pex_builder.info
   pex_info.zip_safe = options.zip_safe
@@ -602,7 +776,7 @@ def build_pex(args, options, resolver_option_builder):
                                               builder=resolver_option_builder,
                                               interpreter=interpreter))
 
-  # pip states the constraints format is identical tor requirements
+  # pip states the constraints format is identical to requirements
   # https://pip.pypa.io/en/stable/user_guide/#constraints-files
   for constraints_txt in options.constraint_files:
     constraints = []
@@ -613,23 +787,19 @@ def build_pex(args, options, resolver_option_builder):
       constraints.append(r)
     resolvables.extend(constraints)
 
-  with TRACER.timed('Resolving distributions'):
-    try:
-      resolveds = resolve_multi(resolvables,
-                                interpreters=interpreters,
-                                platforms=options.platforms,
-                                cache=options.cache_dir,
-                                cache_ttl=options.cache_ttl,
-                                allow_prereleases=resolver_option_builder.prereleases_allowed,
-                                use_manylinux=options.use_manylinux)
-
-      for resolved_dist in resolveds:
-        log('  %s -> %s' % (resolved_dist.requirement, resolved_dist.distribution),
-            V=options.verbosity)
-        pex_builder.add_distribution(resolved_dist.distribution)
-        pex_builder.add_requirement(resolved_dist.requirement)
-    except Unsatisfiable as e:
-      die(e)
+  shared_requirement_kwargs = dict(resolvables=resolvables,
+                                   interpreters=interpreters,
+                                   platforms=options.platforms,
+                                   cache_dir=options.cache_dir,
+                                   cache_ttl=options.cache_ttl,
+                                   prereleases_allowed=resolver_option_builder.prereleases_allowed,
+                                   use_manylinux=options.use_manylinux,
+                                   verbosity=options.verbosity)
+  if fingerprinted_inputs:
+    requirements_checksum = add_fingerprinted_requirements(pex_builder, component_cache_dir,
+                                                           **shared_requirement_kwargs)
+  else:
+    add_unchecked_requirements(pex_builder=pex_builder, **shared_requirement_kwargs)
 
   if options.entry_point and options.script:
     die('Must specify at most one entry point or script.', INVALID_OPTIONS)
@@ -641,6 +811,13 @@ def build_pex(args, options, resolver_option_builder):
 
   if options.python_shebang:
     pex_builder.set_shebang(options.python_shebang)
+
+  if fingerprinted_inputs:
+    pex_info.build_properties['fingerprinted_outputs'] = {
+      'source_dir_hashes': source_dir_hashes,
+      'resource_dir_hashes': resource_dir_hashes,
+      'requirements_checksum': requirements_checksum,
+    }
 
   return pex_builder
 
