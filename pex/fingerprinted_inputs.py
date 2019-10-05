@@ -16,12 +16,13 @@ from threading import Thread
 from traceback import TracebackException
 
 from pex.common import Chroot, grouper_it, walk_files, safe_mkdir
-from pex.compatibility import AbstractClass
+from pex.meta import FrozenFieldsWrapper, frozen_fields, frozen
 from pex.tracer import TRACER
 from pex.util import CacheHelper
 
 
-class _ThreadBase(Thread, AbstractClass):
+@frozen_fields
+class _ThreadBase(Thread, FrozenFieldsWrapper):
 
   class ThreadException(Exception):
     """???"""
@@ -40,16 +41,19 @@ class _ThreadBase(Thread, AbstractClass):
       'log': self.log,
     }
 
+  @frozen
   def start(self):
     super(_ThreadBase, self).start()
     return self
 
+  @frozen
   def join(self):
     super(_ThreadBase, self).join()
     if self._exc_info:
       sys.stderr.write('\n'.join(self._exc_info.format()))
       raise self.ThreadException(f'thread {self.name} errored!')
 
+  @frozen
   def run(self):
     try:
       self.execute()
@@ -60,6 +64,8 @@ class _ThreadBase(Thread, AbstractClass):
   def execute(self):
     """???"""
 
+
+### Traversing fingerprinted sources/resources in parallel!
 
 class TraverseHashes(_ThreadBase):
 
