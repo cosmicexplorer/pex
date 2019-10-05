@@ -6,6 +6,7 @@ from __future__ import absolute_import, print_function
 import atexit
 import contextlib
 import errno
+import itertools
 import os
 import shutil
 import stat
@@ -275,7 +276,7 @@ class Chroot(object):
         "Trying to add %s to fileset(%s) but already in fileset(%s)!" % (
           filename, new_tag, orig_tag))
 
-  def __init__(self, chroot_base):
+  def __init__(self, chroot_base, skip_checking=False):
     """Create the chroot.
 
     :chroot_base Directory for the creation of the target chroot.
@@ -286,6 +287,8 @@ class Chroot(object):
       raise self.ChrootException('Unable to create chroot in %s: %s' % (chroot_base, e))
     self.chroot = chroot_base
     self.filesets = defaultdict(set)
+    self.reverse_filesets = {}
+    self._skip_checking = skip_checking
 
   def clone(self, into=None):
     """Clone this chroot.
@@ -315,13 +318,16 @@ class Chroot(object):
     return dst
 
   def _check_tag(self, fn, label):
-    for fs_label, fs in self.filesets.items():
-      if fn in fs and fs_label != label:
-        raise self.ChrootTaggingException(fn, fs_label, label)
+    if fn in self.reverse_filesets:
+      prev_label = self.reverse_filesets[fn]
+      if prev_label != label:
+        raise self.ChrootTaggingException(fn, prev_label, label)
 
   def _tag(self, fn, label):
-    self._check_tag(fn, label)
+    # if not self._skip_checking:
+    #   self._check_tag(fn, label)
     self.filesets[label].add(fn)
+    self.reverse_filesets[fn] = label
 
   def _ensure_parent(self, path):
     safe_mkdir(os.path.dirname(os.path.join(self.chroot, path)))
@@ -410,3 +416,22 @@ class Chroot(object):
         with open(full_path, 'rb') as open_f:
           data = open_f.read()
         zf.writestr(zinfo, data, compress_type=zipfile.ZIP_DEFLATED)
+
+
+def walk_files(src_dir):
+  src_dir = os.path.normpath(src_dir)
+  for root, dirs, files in os.walk(src_dir):
+    for f in files:
+      yield os.path.join(root, f)
+
+
+# From https://stackoverflow.com/a/8998040/2518889!
+def grouper_it(n, iterable):
+  it = iter(iterable)
+  while True:
+    chunk_it = itertools.islice(it, n)
+    try:
+      first_el = next(chunk_it)
+    except StopIteration:
+      return
+    yield itertools.chain((first_el,), chunk_it)

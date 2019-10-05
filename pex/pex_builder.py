@@ -64,7 +64,7 @@ class PEXBuilder(object):
   class InvalidExecutableSpecification(Error): pass
 
   def __init__(self, path=None, interpreter=None, chroot=None, pex_info=None, preamble=None,
-               copy=False):
+               copy=False, skip_checking=False):
     """Initialize a pex builder.
 
     :keyword path: The path to write the PEX as it is built.  If ``None`` is specified,
@@ -84,7 +84,8 @@ class PEXBuilder(object):
       interpreter exit.
     """
     self._interpreter = interpreter or PythonInterpreter.get()
-    self._chroot = chroot or Chroot(path or safe_mkdtemp())
+    self._chroot = chroot or Chroot(path or safe_mkdtemp(), skip_checking=skip_checking)
+    self.reverse_filesets = self._chroot.reverse_filesets
     self._pex_info = pex_info or PexInfo.default(self._interpreter)
     self._preamble = preamble or ''
     self._copy = copy
