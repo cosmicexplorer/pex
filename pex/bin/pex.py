@@ -20,7 +20,7 @@ from textwrap import TextWrapper
 
 from pex.common import die, safe_delete, safe_mkdir, safe_mkdtemp, walk_files
 from pex.fetcher import Fetcher, PyPIFetcher
-from pex.fingerprinted_inputs import TraverseHashes
+from pex.fingerprinted_inputs import AddFingerprintedSources, AddFingerprintedRequirements
 from pex.interpreter import PythonInterpreter
 from pex.interpreter_constraints import validate_constraints
 from pex.pex import PEX
@@ -561,55 +561,6 @@ def add_unchecked_sources(pex_builder, sources_directory, resources_directory):
     _walk_and_do(pex_builder.add_resource, directory)
 
 
-def add_fingerprinted_sources(pex_builder, source_dir_hashes, resource_dir_hashes,
-                              component_cache_dir, verbosity):
-
-  with TRACER.timed('Resolving fingerprinted source/resource modules'):
-    def _log(*args):
-      log(*args, V=verbosity)
-    threads = [
-      TraverseHashes(
-        source_dir_hashes,
-        add_source_fn=pex_builder.add_source,
-        cache_dir=os.path.join(component_cache_dir, 'sources'),
-        log=_log,
-      ).start(),
-      TraverseHashes(
-        resource_dir_hashes,
-        add_source_fn=pex_builder.add_resource,
-        cache_dir=os.path.join(component_cache_dir, 'resources'),
-        log=_log,
-      ).start(),
-    ]
-    for t in threads:
-      t.join()
-
-  with TRACER.timed('writing out maybe-necessary __init__.py files'):
-    all_file_paths = list(pex_builder.reverse_filesets.keys())
-    all_init_py_files = frozenset(
-      f for f in all_file_paths
-      if os.path.basename(f) == '__init__.py'
-    )
-    def neighboring_init_py_paths(f):
-      while f != '.':
-        f = os.path.normpath(os.path.dirname(f))
-        yield os.path.join(f, '__init__.py')
-      yield os.path.join(f, '__init__.py')
-    all_remaining_init_py_files_to_create = sorted(set(
-      init_py_to_create
-      for f in all_file_paths
-      for init_py_to_create in neighboring_init_py_paths(f)
-      if init_py_to_create not in all_init_py_files
-    ))
-    # TODO: consider parallelizing?
-    for f in all_remaining_init_py_files_to_create:
-      pex_builder._chroot.touch(f)
-
-  # NB: these may be *modified* if they were resolved from `None` -> a fingerprint when scanning
-  # source/resource directories!
-  return (source_dir_hashes, resource_dir_hashes)
-
-
 def add_unchecked_requirements(pex_builder, resolvables, interpreters, platforms, cache_dir,
                                cache_ttl, prereleases_allowed, use_manylinux, verbosity):
   with TRACER.timed('Resolving distributions'):
@@ -634,62 +585,6 @@ def add_unchecked_requirements(pex_builder, resolvables, interpreters, platforms
 def add_fingerprinted_requirements(pex_builder, component_cache_dir, interpreter_constraints,
                                    resolvables, interpreters, platforms, cache_dir, cache_ttl,
                                    prereleases_allowed, use_manylinux, verbosity):
-  requirements_digest = sha1()
-  # NB: Don't hash interpreters, because they may be different across systems. Instead, hash
-  # interpreter constraints!
-  for constraint in interpreter_constraints:
-    requirements_digest.update(constraint.encode())
-  for resolvable in resolvables:
-    requirements_digest.update(str(resolvable).encode())
-  for platform in platforms:
-    requirements_digest.update(platform.encode())
-  requirements_digest.update(str(prereleases_allowed).encode())
-  requirements_digest.update(str(use_manylinux).encode())
-  all_requirements_checksum = requirements_digest.hexdigest()
-
-  requirement_component_cache_dir = os.path.join(component_cache_dir,
-                                                 'requirements',
-                                                 all_requirements_checksum)
-
-  if not os.path.isdir(requirement_component_cache_dir):
-    with TRACER.timed('Resolving distributions and writing to fingerprinted cache'):
-      try:
-        resolveds = resolve_multi(resolvables,
-                                  interpreters=interpreters,
-                                  platforms=platforms,
-                                  cache=cache_dir,
-                                  cache_ttl=cache_ttl,
-                                  allow_prereleases=prereleases_allowed,
-                                  use_manylinux=use_manylinux)
-
-        safe_mkdir(requirement_component_cache_dir)
-        dist_requirement_mapping_file = os.path.join(requirement_component_cache_dir, '.mapping')
-        with open(dist_requirement_mapping_file, 'w') as mapping_file:
-          for resolved_dist in resolveds:
-            req = resolved_dist.requirement
-            dist = resolved_dist.distribution
-            dist_filename = os.path.basename(dist.location)
-            out_location = os.path.join(requirement_component_cache_dir, dist_filename)
-            # Copy the resolved dist to the cached location!
-            shutil.copyfile(dist.location, out_location)
-            # Write the dist and requirement out into the mapping file!
-            mapping_file.write(f'{req}&{dist_filename}\n')
-      except Unsatisfiable as e:
-        die(e)
-  assert os.path.isdir(requirement_component_cache_dir)
-
-  with TRACER.timed('Resolving requirements from fingerprinted cache'):
-    dist_requirement_mapping_file = os.path.join(requirement_component_cache_dir, '.mapping')
-    with open(dist_requirement_mapping_file, 'r') as mapping_file:
-      for entry in mapping_file:
-        req_str, _, dist_filename = tuple(re.sub(r'\n$', '', entry).partition('&'))
-        requirement = Requirement.parse(req_str)
-        full_dist_path = os.path.join(requirement_component_cache_dir, dist_filename)
-        assert os.path.isfile(full_dist_path), f'Requirement {requirement} was not found at specified path {full_dist_path}!'
-        dist = DistributionHelper.distribution_from_path(full_dist_path)
-        log('  %s -> %s' % (requirement, dist), V=verbosity)
-        pex_builder.add_distribution(dist)
-        pex_builder.add_requirement(requirement)
 
   return all_requirements_checksum
 
@@ -742,13 +637,17 @@ def build_pex(args, options, resolver_option_builder):
   else:
     fingerprinted_inputs = None
 
+  def _log(*args):
+    log(*args, V=options.verbosity)
+
   if fingerprinted_inputs:
-    source_dir_hashes, resource_dir_hashes = add_fingerprinted_sources(
-      pex_builder,
-      fingerprinted_inputs['sources'],
-      fingerprinted_inputs['resources'],
-      component_cache_dir,
-      options.verbosity)
+    add_fingerprinted_sources_thread = AddFingerprintedSources(
+      pex_builder=pex_builder,
+      source_dir_hashes=fingerprinted_inputs['sources'],
+      resource_dir_hashes=fingerprinted_inputs['resources'],
+      component_cache_dir=component_cache_dir,
+      log=_log
+    ).start()
   else:
     add_unchecked_sources(pex_builder, options.sources_directory, options.resources_directory)
 
@@ -787,15 +686,19 @@ def build_pex(args, options, resolver_option_builder):
                                    cache_dir=options.cache_dir,
                                    cache_ttl=options.cache_ttl,
                                    prereleases_allowed=resolver_option_builder.prereleases_allowed,
-                                   use_manylinux=options.use_manylinux,
-                                   verbosity=options.verbosity)
+                                   use_manylinux=options.use_manylinux)
   if fingerprinted_inputs:
-    requirements_checksum = add_fingerprinted_requirements(
-      pex_builder, component_cache_dir,
+    add_fingerprinted_requirements_thread = AddFingerprintedRequirements(
+      pex_builder, component_cache_dir, log=_log,
       interpreter_constraints=(options.interpreter_constraint or []),
-      **shared_requirement_kwargs)
+      **shared_requirement_kwargs
+    ).start()
+    # NB: join both threads for sources and for requirements resolution after starting them both!
+    source_dir_hashes, resource_dir_hashes = add_fingerprinted_sources_thread.join().get_fingerprinted_sources()
+    requirements_checksum = add_fingerprinted_requirements_thread.join().requirements_digest
   else:
-    add_unchecked_requirements(pex_builder=pex_builder, **shared_requirement_kwargs)
+    add_unchecked_requirements(pex_builder=pex_builder, verbosity=options.verbosity,
+                               **shared_requirement_kwargs)
 
   if options.entry_point and options.script:
     die('Must specify at most one entry point or script.', INVALID_OPTIONS)
@@ -868,21 +771,23 @@ def main(args=None):
     with TRACER.timed('Building pex'):
       pex_builder = build_pex(reqs, options, resolver_options_builder)
 
-    pex_builder.freeze(bytecode_compile=options.compile)
-    pex = PEX(pex_builder.path(),
-              interpreter=pex_builder.interpreter,
-              verify_entry_point=options.validate_ep)
+    with TRACER.timed('Freezing pex'):
+      pex_builder.freeze(bytecode_compile=options.compile)
+      pex = PEX(pex_builder.path(),
+                interpreter=pex_builder.interpreter,
+                verify_entry_point=options.validate_ep)
 
     if options.pex_name is not None:
       log('Saving PEX file to %s' % options.pex_name, V=options.verbosity)
       tmp_name = options.pex_name + '~'
-      safe_delete(tmp_name)
-      pex_builder.build(
-        tmp_name,
-        bytecode_compile=options.compile,
-        deterministic_timestamp=not options.use_system_time
-      )
-      os.rename(tmp_name, options.pex_name)
+      with TRACER.timed('Create pex output file'):
+        safe_delete(tmp_name)
+        pex_builder.build(
+          tmp_name,
+          bytecode_compile=options.compile,
+          deterministic_timestamp=not options.use_system_time
+        )
+        os.rename(tmp_name, options.pex_name)
     else:
       if not _compatible_with_current_platform(options.platforms):
         log('WARNING: attempting to run PEX with incompatible platforms!')
