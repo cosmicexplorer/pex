@@ -631,12 +631,20 @@ def add_unchecked_requirements(pex_builder, resolvables, interpreters, platforms
       die(e)
 
 
-def add_fingerprinted_requirements(pex_builder, component_cache_dir, resolvables, interpreters,
-                                   platforms, cache_dir, cache_ttl, prereleases_allowed,
-                                   use_manylinux, verbosity):
+def add_fingerprinted_requirements(pex_builder, component_cache_dir, interpreter_constraints,
+                                   resolvables, interpreters, platforms, cache_dir, cache_ttl,
+                                   prereleases_allowed, use_manylinux, verbosity):
   requirements_digest = sha1()
+  # NB: Don't hash interpreters, because they may be different across systems. Instead, hash
+  # interpreter constraints!
+  for constraint in interpreter_constraints:
+    requirements_digest.update(constraint.encode())
   for resolvable in resolvables:
     requirements_digest.update(str(resolvable).encode())
+  for platform in platforms:
+    requirements_digest.update(platform.encode())
+  requirements_digest.update(str(prereleases_allowed).encode())
+  requirements_digest.update(str(use_manylinux).encode())
   all_requirements_checksum = requirements_digest.hexdigest()
 
   requirement_component_cache_dir = os.path.join(component_cache_dir,
@@ -782,8 +790,10 @@ def build_pex(args, options, resolver_option_builder):
                                    use_manylinux=options.use_manylinux,
                                    verbosity=options.verbosity)
   if fingerprinted_inputs:
-    requirements_checksum = add_fingerprinted_requirements(pex_builder, component_cache_dir,
-                                                           **shared_requirement_kwargs)
+    requirements_checksum = add_fingerprinted_requirements(
+      pex_builder, component_cache_dir,
+      interpreter_constraints=(options.interpreter_constraint or []),
+      **shared_requirement_kwargs)
   else:
     add_unchecked_requirements(pex_builder=pex_builder, **shared_requirement_kwargs)
 
