@@ -568,53 +568,82 @@ def add_unchecked_sources(pex_builder, sources_directory, resources_directory):
 
 
 def add_fingerprinted_sources(pex_builder, source_dir_hashes, resource_dir_hashes,
-                              sources_directory, resources_directory, component_cache_dir,
-                              verbosity):
+                              component_cache_dir, verbosity):
 
-  def is_empty_fingerprint(fp):
-    return fp == '???'
-
-  def helper(maybe_fingerprinted_module_names, input_dirs, cache_subdir, add_source_fn):
-    for module_name, maybe_fingerprint in maybe_fingerprinted_module_names.items():
-      assert os.path.sep not in module_name, f'fingerprinted module name {module_name} should not contain "{os.path.sep}"!'
+  def helper(maybe_fingerprinted_module_names, cache_subdir, add_source_fn):
+    for module_name, entries_by_source_root in maybe_fingerprinted_module_names.items():
+      assert os.path.sep not in module_name, f'fingerprinted module name {module_name} should not contain \'{os.path.sep}\'!'
       relpath_for_module = module_name.replace('.', os.path.sep)
 
       def get_fingerprinted_cache_dir(fingerprint):
         return os.path.join(component_cache_dir, cache_subdir, fingerprint)
 
-      if not is_empty_fingerprint(maybe_fingerprint):
-        prespecified_cache_dir = get_fingerprinted_cache_dir(maybe_fingerprint)
-        log(f'reading {module_name} from prespecified_cache_dir: {prespecified_cache_dir}',
-            V=verbosity)
-        if os.path.isdir(prespecified_cache_dir):
-          _walk_and_do(add_source_fn, prespecified_cache_dir)
-          continue
+      for directory, entries in entries_by_source_root.items():
+        orig_directory = directory
+        if directory == '':
+          directory = '.'
+        processed_entries = [
+          (e['files'], e['checksum'])
+          for e in entries
+        ]
 
-      for directory in input_dirs:
-        full_dir_path = os.path.join(directory, relpath_for_module)
-        if os.path.isdir(full_dir_path):
-          dir_hash = CacheHelper.dir_hash(full_dir_path)
-          if is_empty_fingerprint(maybe_fingerprint):
-            maybe_fingerprinted_module_names[module_name] = dir_hash
-          else:
-            assert dir_hash == maybe_fingerprint, f'checksum for directory {full_dir_path} was wrong: expected hash should be {dir_hash}, was {maybe_fingerprint}!'
-          base_cache_dir = get_fingerprinted_cache_dir(dir_hash)
-          cache_dir = os.path.join(base_cache_dir, relpath_for_module)
-          if not os.path.isdir(cache_dir):
-            safe_mkdir(os.path.dirname(cache_dir))
-            shutil.copytree(full_dir_path, cache_dir)
-          log(f'reading {module_name} from cache_dir: {cache_dir}', V=verbosity)
-          _walk_and_do(add_source_fn, base_cache_dir)
-          break
-      else:
-        die(f'Failed to resolve {cache_subdir} module {module_name} with fingerprint {maybe_fingerprint}!')
+        all_hydrated_entries = []
+        for source_paths, maybe_fingerprint in processed_entries:
+          if maybe_fingerprint is not None:
+            assert source_paths is not None, f"the 'files' key must be provided for module {module_name}, because the 'checksum' {maybe_fingerprint} was provided!"
+            prespecified_cache_dir = get_fingerprinted_cache_dir(maybe_fingerprint)
+            log(f'reading {module_name} from prespecified_cache_dir: {prespecified_cache_dir}',
+                V=verbosity)
+            # TODO: maybe check that the source paths match the files in the cache dir?
+            if os.path.isdir(prespecified_cache_dir):
+              _walk_and_do(add_source_fn, prespecified_cache_dir)
+              continue
+
+          full_dir_path = os.path.join(directory, relpath_for_module)
+          if os.path.isdir(full_dir_path):
+            # The sources weren't provided, so we assume the entire directory is intended.
+            if source_paths is None:
+              source_paths = [
+                os.path.relpath(src_file_path, directory)
+                for src_file_path in _walk_files(full_dir_path)
+              ]
+
+            digest = sha1()
+            for f in source_paths:
+              full_file_path = os.path.join(directory, f)
+              CacheHelper.hash(full_file_path, digest=digest)
+            component_hash = digest.hexdigest()
+
+            if maybe_fingerprint is not None:
+              assert component_hash == maybe_fingerprint, f'checksum for component at {full_dir_path} was wrong: expected hash should be {component_hash}, was {maybe_fingerprint}!'
+
+            base_cache_dir = get_fingerprinted_cache_dir(component_hash)
+            cache_dir = os.path.join(base_cache_dir, relpath_for_module)
+            if not os.path.isdir(cache_dir):
+              safe_mkdir(cache_dir)
+              for f in source_paths:
+                full_file_path = os.path.join(directory, f)
+                output_file_path = os.path.join(cache_dir, f)
+                safe_mkdir(os.path.dirname(output_file_path))
+                shutil.copyfile(full_file_path, output_file_path)
+            log(f'reading {module_name} from cache_dir: {cache_dir}', V=verbosity)
+            _walk_and_do(add_source_fn, base_cache_dir)
+
+            all_hydrated_entries.append({
+              'files': source_paths,
+              'checksum': component_hash,
+            })
+
+        # Hydrate the `source_paths` and `component_hash` for this module, in case either of
+        # them were `None` previously.
+        maybe_fingerprinted_module_names[module_name][orig_directory] = all_hydrated_entries
 
   with TRACER.timed('Resolving fingerprinted source modules'):
-    helper(source_dir_hashes, sources_directory, 'sources', pex_builder.add_source)
+    helper(source_dir_hashes, 'sources', pex_builder.add_source)
   with TRACER.timed('Resolving fingerprinted resource modules'):
-    helper(resource_dir_hashes, resources_directory, 'resources', pex_builder.add_resource)
+    helper(resource_dir_hashes, 'resources', pex_builder.add_resource)
 
-  # NB: these may be *modified* if they were resolved from ??? -> a fingerprint when scanning
+  # NB: these may be *modified* if they were resolved from `None` -> a fingerprint when scanning
   # source/resource directories!
   return (source_dir_hashes, resource_dir_hashes)
 
@@ -734,25 +763,19 @@ def build_pex(args, options, resolver_option_builder):
 
   pex_builder = PEXBuilder(path=safe_mkdtemp(), interpreter=interpreter, preamble=preamble)
 
-  component_cache_dir = os.path.join(options.cache_dir, 'components')
-
   if options.fingerprinted_inputs is not None:
+    assert options.cache_dir, f'using --with-fingerprinted-inputs requires that a cache be available!'
     with open(options.fingerprinted_inputs, 'rb') as json_fingerprints:
       fingerprinted_inputs = json.load(json_fingerprints)
+      component_cache_dir = os.path.join(options.cache_dir, 'components')
   else:
     fingerprinted_inputs = None
-
-  def into_ordered_dict(json_list_of_two_element_lists):
-    """Convert [[a, b], [c, d]] -> {a: b, c: d} (ordered)."""
-    return OrderedDict(tuple(entry) for entry in json_list_of_two_element_lists)
 
   if fingerprinted_inputs:
     source_dir_hashes, resource_dir_hashes = add_fingerprinted_sources(
       pex_builder,
-      into_ordered_dict(fingerprinted_inputs['sources']),
-      into_ordered_dict(fingerprinted_inputs['resources']),
-      options.sources_directory,
-      options.resources_directory,
+      fingerprinted_inputs['sources'],
+      fingerprinted_inputs['resources'],
       component_cache_dir,
       options.verbosity)
   else:
