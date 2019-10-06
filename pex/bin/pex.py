@@ -458,6 +458,23 @@ def configure_clp():
   )
 
   parser.add_option(
+    '--remote-component-cache-baseurl',
+    dest='remote_component_cache_baseurl',
+    default=None,
+    type=str,
+    help='WARNING: EXPERIMENTAL!!! Url denoting a remote component cache directory.',
+  )
+
+  parser.add_option(
+    '--without-local-fingerprinted-inputs',
+    dest='without_local_fingerprinted_inputs',
+    default=False,
+    type=str,
+    help='WARNING: EXPERIMENTAL!!! Whether to attempt to resolve missing components from '
+          'fingerprinted inputs, or to rely *solely* on the remote/local component cache.',
+  )
+
+  parser.add_option(
       '-p', '--preamble-file',
       dest='preamble_file',
       metavar='FILE',
@@ -690,6 +707,8 @@ def build_pex(args, options, resolver_option_builder):
   if fingerprinted_inputs:
     add_fingerprinted_requirements_thread = AddFingerprintedRequirements(
       pex_builder, component_cache_dir, log=_log,
+      remote_cache_baseurl=options.remote_cache_baseurl,
+      without_local_fingerprinted_inputs=options.without_local_fingerprinted_inputs,
       interpreter_constraints=(options.interpreter_constraint or []),
       **shared_requirement_kwargs
     ).start()
