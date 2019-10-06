@@ -177,13 +177,17 @@ class AddAndFingerprintSourcePaths(_TraverseThreadBase):
       for f in self._source_paths
     )
     assert sorted_all == sorted_provided, f'files for module {self._module_name}, dir {self._directory}, checksum {fingerprint} in {src_dir} should have been {sorted_all}, was {sorted_provided}!'
-    return sorted_all
+    return [
+      os.path.normpath(os.path.relpath(f, self._relpath_for_module))
+      for f in sorted_all
+    ]
 
   def execute(self):
     if self._maybe_fingerprint is None:
       if self.without_local_fingerprinted_inputs:
-        die(f'Fingerint was not provided for a {self._module_name} entry within directory '
-            '{self._directory} while --without-local-fingerprinted-inputs is specified!')
+        raise ValueError(
+          f'Fingerint was not provided for a {self._module_name} entry within directory '
+          '{self._directory} while --without-local-fingerprinted-inputs is specified!')
     else:
       cache_entry_relpath = os.path.join(self.cache_subdir, self._maybe_fingerprint)
       maybe_dir_from_cache = try_local_then_remote_cache(
@@ -195,15 +199,16 @@ class AddAndFingerprintSourcePaths(_TraverseThreadBase):
       if maybe_dir_from_cache:
         assert os.path.isdir(maybe_dir_from_cache)
         with TRACER.timed('Add sources from cache dir'):
-          sorted_sources = self._walk_and_add(prespecified_cache_dir, self._maybe_fingerprint)
+          sorted_sources = self._walk_and_add(maybe_dir_from_cache, self._maybe_fingerprint)
         self.checksummed_sources = {
           'files': sorted_sources,
           'checksum': self._maybe_fingerprint,
         }
         return
-      elif self._without_local_fingerprinted_inputs:
-        die(f'Failed to retrieve source componet {cache_entry_relpath} from local or remote cache '
-            'while --without-local-fingerprinted-inputs is specified!')
+      elif self.without_local_fingerprinted_inputs:
+        raise ValueError(
+          f'Failed to retrieve source component {cache_entry_relpath} from local or remote cache '
+          'while --without-local-fingerprinted-inputs is specified!')
 
     full_dir_path = os.path.normpath(os.path.join(self._directory, self._relpath_for_module))
     assert os.path.isdir(full_dir_path), f'directory path {full_dir_path} does not exist! (from dir {self._directory}, module {self._module_name})'
@@ -300,7 +305,8 @@ class HashFileSet(_TraverseThreadBase):
 
 class AddFingerprintedSources(_ThreadBase):
 
-  def __init__(self, pex_builder, source_dir_hashes, resource_dir_hashes, component_cache_dir, log):
+  def __init__(self, pex_builder, source_dir_hashes, resource_dir_hashes, component_cache_dir,
+               remote_cache_baseurl, without_local_fingerprinted_inputs, log):
     super(AddFingerprintedSources, self).__init__(name='add-fingerprinted-sources', log=log)
     self._pex_builder = pex_builder
     # NB: these may be *modified* if they were resolved from `None` -> a fingerprint when scanning
@@ -308,6 +314,8 @@ class AddFingerprintedSources(_ThreadBase):
     self.source_dir_hashes = source_dir_hashes
     self.resource_dir_hashes = resource_dir_hashes
     self._component_cache_dir = component_cache_dir
+    self._remote_cache_baseurl = remote_cache_baseurl
+    self._without_local_fingerprinted_inputs = without_local_fingerprinted_inputs
 
   def get_fingerprinted_sources(self):
     return (self.source_dir_hashes, self.resource_dir_hashes)
@@ -320,6 +328,8 @@ class AddFingerprintedSources(_ThreadBase):
           add_source_fn=self._pex_builder.add_source,
           cache_base_dir=self._component_cache_dir,
           cache_subdir='sources',
+          remote_cache_baseurl=self._remote_cache_baseurl,
+          without_local_fingerprinted_inputs=self._without_local_fingerprinted_inputs,
           log=self.log,
         ).start(),
         TraverseHashes(
@@ -327,6 +337,8 @@ class AddFingerprintedSources(_ThreadBase):
           add_source_fn=self._pex_builder.add_resource,
           cache_base_dir=self._component_cache_dir,
           cache_subdir='resources',
+          remote_cache_baseurl=self._remote_cache_baseurl,
+          without_local_fingerprinted_inputs=self._without_local_fingerprinted_inputs,
           log=self.log,
         ).start(),
       ]
@@ -375,22 +387,26 @@ def try_local_then_remote_cache(component_cache_dir, cache_entry_relpath, remote
                                 log):
   cache_dir = os.path.join(component_cache_dir, cache_entry_relpath)
   if os.path.isdir(cache_dir):
-    log('Found cache entry {cache_entry_relpath} in local cache!')
+    log(f'Found cache entry {cache_entry_relpath} in local cache!')
     return cache_dir
+
+  if not remote_cache_baseurl:
+    return None
 
   if not remote_cache_baseurl.endswith('/'):
     remote_cache_baseurl += '/'
+
   remote_base_url = urlparse.urlparse(remote_cache_baseurl)
   if not remote_base_url.scheme:
-    remote_url = 'https://' + remote_base_url
+    remote_url = 'https://' + remote_base_url.geturl()
   else:
-    remote_url = remote_base_url
-  remote_url = urljoin(remote_url, cache_entry_relpath)
+    remote_url = remote_base_url.geturl()
+  remote_url = urljoin(remote_url, cache_entry_relpath) + '.zip'
 
   with TRACER.timed('Fetch from remote component cache'):
     r = requests.get(remote_url)
     if r.ok:
-      log('Found cache entry {cache_entry_relpath} in remote cache!')
+      log(f'Found cache entry {cache_entry_relpath} in remote cache!')
       with zipfile.ZipFile(BytesIO(r.content)) as zf:
         safe_mkdir(cache_dir)
         zf.extractall(cache_dir)
@@ -502,36 +518,33 @@ class AddFingerprintedRequirements(_ThreadBase):
       assert os.path.isdir(maybe_dir_from_cache)
       assert requirement_component_cache_dir == maybe_dir_from_cache
     elif self._without_local_fingerprinted_inputs:
-      die(f'Failed to find requirement component {all_requirements_checksum} from local or remote '
-          'cache while --without-local-fingerprinted-inputs is specified!')
+      raise ValueError(
+        f'Failed to find requirement component {all_requirements_checksum} from local or remote '
+        'cache while --without-local-fingerprinted-inputs is specified!')
     else:
       with TRACER.timed('Resolving distributions and writing to fingerprinted cache'):
-        try:
-          resolveds = resolve_multi(self._resolvables,
-                                    interpreters=self._interpreters,
-                                    platforms=self._platforms,
-                                    cache=self._cache_dir,
-                                    cache_ttl=self._cache_ttl,
-                                    allow_prereleases=self._prereleases_allowed,
-                                    use_manylinux=self._use_manylinux)
-
-          with TRACER.timed('Copying resolveds to cache'):
-            safe_mkdir(requirement_component_cache_dir)
-            dist_requirement_mapping_file = os.path.join(requirement_component_cache_dir, '.mapping')
-            cached_resolveds_pairs = []
-            with open(dist_requirement_mapping_file, 'w') as mapping_file:
-              for resolved_dist in resolveds:
-                req = resolved_dist.requirement
-                dist = resolved_dist.distribution
-                dist_filename = os.path.basename(dist.location)
-                out_location = os.path.join(requirement_component_cache_dir, dist_filename)
-                cached_resolveds_pairs.append((dist.location, out_location))
-                # Write the dist and requirement out into the mapping file!
-                mapping_file.write(f'{req}&{dist_filename}\n')
-            # NB: Write the resolved requirements to the cache, in parallel!
-            cache_requirements(cached_resolveds_pairs)
-        except Unsatisfiable as e:
-          die(e)
+        resolveds = resolve_multi(self._resolvables,
+                                  interpreters=self._interpreters,
+                                  platforms=self._platforms,
+                                  cache=self._cache_dir,
+                                  cache_ttl=self._cache_ttl,
+                                  allow_prereleases=self._prereleases_allowed,
+                                  use_manylinux=self._use_manylinux)
+        with TRACER.timed('Copying resolveds to cache'):
+          safe_mkdir(requirement_component_cache_dir)
+          dist_requirement_mapping_file = os.path.join(requirement_component_cache_dir, '.mapping')
+          cached_resolveds_pairs = []
+          with open(dist_requirement_mapping_file, 'w') as mapping_file:
+            for resolved_dist in resolveds:
+              req = resolved_dist.requirement
+              dist = resolved_dist.distribution
+              dist_filename = os.path.basename(dist.location)
+              out_location = os.path.join(requirement_component_cache_dir, dist_filename)
+              cached_resolveds_pairs.append((dist.location, out_location))
+              # Write the dist and requirement out into the mapping file!
+              mapping_file.write(f'{req}&{dist_filename}\n')
+          # NB: Write the resolved requirements to the cache, in parallel!
+          cache_requirements(cached_resolveds_pairs)
     assert os.path.isdir(requirement_component_cache_dir)
 
     with TRACER.timed('Resolving requirements from fingerprinted cache'):

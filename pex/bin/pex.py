@@ -663,6 +663,8 @@ def build_pex(args, options, resolver_option_builder):
       source_dir_hashes=fingerprinted_inputs['sources'],
       resource_dir_hashes=fingerprinted_inputs['resources'],
       component_cache_dir=component_cache_dir,
+      remote_cache_baseurl=options.remote_component_cache_baseurl,
+      without_local_fingerprinted_inputs=options.without_local_fingerprinted_inputs,
       log=_log
     ).start()
   else:
@@ -707,7 +709,7 @@ def build_pex(args, options, resolver_option_builder):
   if fingerprinted_inputs:
     add_fingerprinted_requirements_thread = AddFingerprintedRequirements(
       pex_builder, component_cache_dir, log=_log,
-      remote_cache_baseurl=options.remote_cache_baseurl,
+      remote_cache_baseurl=options.remote_component_cache_baseurl,
       without_local_fingerprinted_inputs=options.without_local_fingerprinted_inputs,
       interpreter_constraints=(options.interpreter_constraint or []),
       **shared_requirement_kwargs
