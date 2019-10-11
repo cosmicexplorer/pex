@@ -7,13 +7,20 @@ i've added some random files, so you can run e.g.:
 
     $ time PYTHONPATH="$(pwd)" python3.6 -m pex.bin.pex --with-fingerprinted-inputs=demo2.json --remote-component-cache-baseurl='https://secret-url.io/home/pex/v1.6.11+with.incrementalism/components' requests -vvvvvvvvv --no-compile --no-use-system-time -o lol.pex
 
+- **This branch shows how the above command line can be used to re-deploy pexes incredibly fast and/or instantaneously.**
+- `pex/fingerprinted_inputs.py` has a lot of the impl, `pex/bin/pex.py` has the new command-line options
+- i was about to get to a hacky script which does the part of syncing the local "component cache" with some remote cache, but it was only going to work inside twitter, so I don't have a script that clearly shows how this can be done yet.
+
 Basic Premise
 =============
-- "source"/"resources" are provided in a json file with checksums, are resolved from a local or remote cache, and if not there, then read from the filesystem.
-- the same cache is used to store the result of a resolve: basically hashing everything requirements, interpreter constraints, etc to find a cache key for the precise resolve
-and all of everything is done in its own thread (but idk how to do good threading in python and maybe that code is bad)
-pex/fingerprinted_inputs.py has a lot of the impl, pex/bin/pex.py has the new options
-and i was about to get to a hacky script which does the part of syncing the local "component cache" with some remote cache, but it was only going to work inside twitter. the specific implementation of the cache can be whatever, i just tried to do what worked
+1. "source"/"resources" are provided in a json file with checksums, are resolved from a local or remote cache, and if not there, then read from the filesystem.
+2. the same cache is used to store the result of a resolve: basically hashing everything requirements, interpreter constraints, etc to find a cache key for the precise resolve
+3. this cache is mirrored remotely
+4. **when redeploying a pex with only minor changes (e.g. to only one source file), a small json file can be sent over and the remote machine will only download the compressed form of the single changed source module before executing!**
+
+Multithreading
+==============
+- All of everything is done in its own thread (but idk how to do good threading in python and maybe that code is bad). Most of this is in `pex/fingerpinted_inputs.py`.
 
 The Super Fast Deploy Process
 =============================
