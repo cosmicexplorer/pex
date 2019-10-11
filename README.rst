@@ -9,6 +9,7 @@ i've added some random files, so you can run e.g.:
 
 - **This branch shows how the above command line can be used to re-deploy pexes incredibly fast and/or instantaneously.**
 - ``pex/fingerprinted_inputs.py`` has a lot of the impl, ``pex/bin/pex.py`` has the new command-line options
+- ``demo2.json`` shows what a real input file to ``--with-fingerprinted-inputs`` looks like.
 - i was about to get to a hacky script which does the part of syncing the local "component cache" with some remote cache, but it was only going to work inside twitter, so I don't have a script that clearly shows how this can be done yet.
 
 Basic Premise
