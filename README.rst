@@ -8,7 +8,7 @@ i've added some random files, so you can run e.g.:
     $ time PYTHONPATH="$(pwd)" python3.6 -m pex.bin.pex --with-fingerprinted-inputs=demo2.json --remote-component-cache-baseurl='https://secret-url.io/home/pex/v1.6.11+with.incrementalism/components' requests -vvvvvvvvv --no-compile --no-use-system-time -o lol.pex
 
 - **This branch shows how the above command line can be used to re-deploy pexes incredibly fast and/or instantaneously.**
-- `pex/fingerprinted_inputs.py` has a lot of the impl, `pex/bin/pex.py` has the new command-line options
+- ``pex/fingerprinted_inputs.py`` has a lot of the impl, ``pex/bin/pex.py`` has the new command-line options
 - i was about to get to a hacky script which does the part of syncing the local "component cache" with some remote cache, but it was only going to work inside twitter, so I don't have a script that clearly shows how this can be done yet.
 
 Basic Premise
@@ -20,7 +20,7 @@ Basic Premise
 
 Multithreading
 ==============
-- All of everything is done in its own thread (but idk how to do good threading in python and maybe that code is bad). Most of this is in `pex/fingerpinted_inputs.py`.
+- All of everything is done in its own thread (but idk how to do good threading in python and maybe that code is bad). Most of this is in ``pex/fingerpinted_inputs.py``.
 
 The Super Fast Deploy Process
 =============================
@@ -29,8 +29,8 @@ The Super Fast Deploy Process
 - send over a json file to the remote machine with the checksummed inputs json file
 - invoke pex on the remote machine with the exact same command line as on your local machine, and everything will be resolved from the local or remote cache (there's a flag to make it avoid trying to pull any files from the filesystem), very quickly, in parallel
 i wasn't sure yet how to structure these PRs but i really think there's value in this approach and am willing to be extremely flexible
-oh and the cache is just a bunch of directories with checksums as the name that get populated in `~/.pex/build/components/{sources,resources,requirements}`, and you can provide pex a base url for attempting to resolve entries from the remote cache
--  `--without-local-fingerprinted-inputs=true` (the option isn't a real boolean, i screwed it up, so just for right now either include the arg with =true or don't) says to not try to check the filesystem or perform a resolve yourself, and to error out if it's not in the local or remote caches (edited)
+oh and the cache is just a bunch of directories with checksums as the name that get populated in ``~/.pex/build/components/{sources,resources,requirements}``, and you can provide pex a base url for attempting to resolve entries from the remote cache
+-  ``--without-local-fingerprinted-inputs=true`` (the option isn't a real boolean, i screwed it up, so just for right now either include the arg with =true or don't) says to not try to check the filesystem or perform a resolve yourself, and to error out if it's not in the local or remote caches (edited)
 
 PEX
 ===
