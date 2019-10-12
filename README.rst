@@ -29,7 +29,10 @@ The Super Fast Deploy Process
 - ensure the local cache on the build machine is then synced with the remote machine (this could be done within pex too maybe)
 - send over a json file to the remote machine with the checksummed inputs json file
 - invoke pex on the remote machine with the exact same command line as on your local machine, and everything will be resolved from the local or remote cache (there's a flag to make it avoid trying to pull any files from the filesystem), very quickly, in parallel
-i wasn't sure yet how to structure these PRs but i really think there's value in this approach and am willing to be extremely flexible
+
+Notes
+=====
+- i wasn't sure yet how to structure these PRs but i really think there's value in this approach and am willing to be extremely flexible
 oh and the cache is just a bunch of directories with checksums as the name that get populated in ``~/.pex/build/components/{sources,resources,requirements}``, and you can provide pex a base url for attempting to resolve entries from the remote cache
 -  ``--without-local-fingerprinted-inputs=true`` (the option isn't a real boolean, i screwed it up, so just for right now either include the arg with =true or don't) says to not try to check the filesystem or perform a resolve yourself, and to error out if it's not in the local or remote caches (edited)
 
