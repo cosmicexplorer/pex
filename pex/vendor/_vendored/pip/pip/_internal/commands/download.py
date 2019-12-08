@@ -59,6 +59,7 @@ class DownloadCommand(RequirementCommand):
         cmd_opts.add_option(cmdoptions.no_build_isolation())
         cmd_opts.add_option(cmdoptions.use_pep517())
         cmd_opts.add_option(cmdoptions.no_use_pep517())
+        cmd_opts.add_option(cmdoptions.quickly_parse_sub_requirements())
 
         cmd_opts.add_option(
             '-d', '--dest', '--destination-dir', '--destination-directory',
@@ -139,6 +140,7 @@ class DownloadCommand(RequirementCommand):
                 finder=finder,
                 options=options,
                 py_version_info=options.python_version,
+                quickly_parse_sub_requirements=options.quickly_parse_sub_requirements,
             )
 
             self.trace_basic_info(finder)

@@ -15,12 +15,18 @@ for sub-dependencies
 # mypy: disallow-untyped-defs=False
 
 import logging
+import re
+import struct
 import sys
+import zlib
 from collections import defaultdict
 from itertools import chain
 
 from pip._vendor.packaging import specifiers
+from pip._vendor.packaging.requirements import Requirement
 
+from pip._internal.distributions.base import AbstractDistribution
+from pip._internal.download import get_url_scheme
 from pip._internal.exceptions import (
     BestVersionAlreadyInstalled,
     DistributionNotFound,
@@ -28,6 +34,7 @@ from pip._internal.exceptions import (
     HashErrors,
     UnsupportedPythonVersion,
 )
+from pip._internal.req.req_install import InstallRequirement
 from pip._internal.utils.logging import indent_log
 from pip._internal.utils.misc import (
     dist_in_usersite,
@@ -46,8 +53,9 @@ if MYPY_CHECK_RUNNING:
 
     from pip._internal.distributions import AbstractDistribution
     from pip._internal.index.package_finder import PackageFinder
+    from pip._internal.network.session import PipSession
+    from pip._internal.index import PackageFinder
     from pip._internal.operations.prepare import RequirementPreparer
-    from pip._internal.req.req_install import InstallRequirement
     from pip._internal.req.req_set import RequirementSet
 
     InstallRequirementProvider = Callable[
@@ -106,6 +114,46 @@ def _check_dist_requires_python(
         ))
 
 
+class LazyDistribution(AbstractDistribution):
+
+    def has_been_downloaded(self):
+        return False
+
+    def get_pkg_resources_distribution(self):
+        raise NotImplementedError('!!!!')
+
+    def prepare_distribution_metadata(self, finder, build_isolation):
+        raise NotImplementedError('????')
+
+
+# From https://stackoverflow.com/a/1089787/2518889:
+def _inflate(data):
+    decompress = zlib.decompressobj(-zlib.MAX_WBITS)
+    inflated = decompress.decompress(data)
+    inflated += decompress.flush()
+    return inflated
+
+
+def _decode_4_byte_unsigned(byte_string):
+    """Unpack as a little-endian unsigned long."""
+    assert isinstance(byte_string, bytes) and len(byte_string) == 4, byte_string
+    return struct.unpack('<L', byte_string)[0]
+
+
+def _decode_2_byte_unsigned(byte_string):
+    """Unpack as a little-endian unsigned short."""
+    assert isinstance(byte_string, bytes) and len(byte_string) == 2
+    return struct.unpack('<H', byte_string)[0]
+
+
+class MetadataOnlyResolveException(Exception):
+    """???"""
+
+    def __init__(self, requirements):
+        super().__init__()
+        self.requirements = requirements
+
+
 class Resolver(object):
     """Resolves which packages need to be installed/uninstalled to perform \
     the requested operation without breaking the requirements of any package.
@@ -125,6 +173,7 @@ class Resolver(object):
         force_reinstall,  # type: bool
         upgrade_strategy,  # type: str
         py_version_info=None,  # type: Optional[Tuple[int, ...]]
+        quickly_parse_sub_requirements=False, # type: bool
     ):
         # type: (...) -> None
         super(Resolver, self).__init__()
@@ -150,6 +199,8 @@ class Resolver(object):
 
         self._discovered_dependencies = \
             defaultdict(list)  # type: DiscoveredDependencies
+
+        self.quickly_parse_sub_requirements = quickly_parse_sub_requirements
 
     def resolve(self, requirement_set):
         # type: (RequirementSet) -> None
@@ -179,10 +230,23 @@ class Resolver(object):
         # req.populate_link() needs to be called before we can make decisions
         # based on link type.
         discovered_reqs = []  # type: List[InstallRequirement]
+        forced_eager_recs = []
         hash_errors = HashErrors()
-        for req in chain(root_reqs, discovered_reqs):
+
+        found_reqs = set()
+
+        for req in chain(root_reqs, discovered_reqs, forced_eager_recs):
+            if req.name in found_reqs:
+                continue
+            found_reqs.add(req.name)
             try:
-                discovered_reqs.extend(self._resolve_one(requirement_set, req))
+                for r in self._resolve_one(requirement_set, req):
+                    if r.name == 'functools32':
+                        continue
+                    if r.force_eager_download:
+                        forced_eager_recs.append(r)
+                    else:
+                        discovered_reqs.append(r)
             except HashError as exc:
                 exc.req = req
                 hash_errors.append(exc)
@@ -286,7 +350,14 @@ class Resolver(object):
 
         # We eagerly populate the link, since that's our "legacy" behavior.
         require_hashes = self.preparer.require_hashes
+
         req.populate_link(self.finder, upgrade_allowed, require_hashes)
+
+        # If we've been configured to hack out the METADATA file from a remote wheel, extract sub
+        # requirements first!
+        if self.quickly_parse_sub_requirements and (not req.force_eager_download) and req.link.is_wheel_file():
+            return LazyDistribution(req)
+
         abstract_dist = self.preparer.prepare_linked_requirement(req)
 
         # NOTE
@@ -317,6 +388,87 @@ class Resolver(object):
 
         return abstract_dist
 
+    def _hacky_extract_sub_reqs(self, req):
+        """Obtain the dependencies of a wheel requirement by scanning the METADATA file."""
+        url = str(req.link)
+        scheme = get_url_scheme(url)
+        assert scheme in ['http', 'https']
+
+        head_resp = self.session.head(url)
+        head_resp.raise_for_status()
+        assert 'bytes' in head_resp.headers['Accept-Ranges']
+        wheel_content_length = int(head_resp.headers['Content-Length'])
+
+        shallow_begin = max(wheel_content_length - 2000, 0)
+        wheel_shallow_resp = self.session.get(url, headers={
+            'Range': f'bytes={shallow_begin}-{wheel_content_length}',
+        })
+        wheel_shallow_resp.raise_for_status()
+        if wheel_content_length <= 2000:
+            last_2k_bytes = wheel_shallow_resp.content
+        else:
+            assert len(wheel_shallow_resp.content) >= 2000
+            last_2k_bytes = wheel_shallow_resp.content[-2000:]
+
+        sanitized_requirement_name = req.name.lower().replace('-', '_')
+        metadata_file_pattern = f'{sanitized_requirement_name}[^/]+?.dist-info/METADATAPK'.encode()
+        filename_in_central_dir_header = re.search(metadata_file_pattern, last_2k_bytes,
+                                                   flags=re.IGNORECASE)
+        try:
+            _st = filename_in_central_dir_header.start()
+        except AttributeError as e:
+            raise Exception(f'req: {req}, pat: {metadata_file_pattern}, len(b): {len(last_2k_bytes)}') from e
+
+        encoded_offset_for_local_file = last_2k_bytes[(_st - 4):_st]
+        _off = _decode_4_byte_unsigned(encoded_offset_for_local_file)
+
+        local_file_header_resp = self.session.get(url, headers={
+            'Range': f'bytes={_off+18}-{_off+30}',
+        })
+        local_file_header_resp.raise_for_status()
+
+        if len(local_file_header_resp.content) == 13:
+            file_header_no_filename = local_file_header_resp.content[:12]
+        elif len(local_file_header_resp.content) > 12:
+            file_header_no_filename = local_file_header_resp.content[(_off + 18):(_off + 30)]
+        else:
+            file_header_no_filename = local_file_header_resp.content
+
+        try:
+            compressed_size = _decode_4_byte_unsigned(file_header_no_filename[:4])
+        except AssertionError as e:
+            raise Exception(f'c: {local_file_header_resp.content}, _off: {_off}') from e
+        uncompressed_size = _decode_4_byte_unsigned(file_header_no_filename[4:8])
+        file_name_length = _decode_2_byte_unsigned(file_header_no_filename[8:10])
+        assert file_name_length == (len(filename_in_central_dir_header.group(0)) - 2)
+        extra_field_length = _decode_2_byte_unsigned(file_header_no_filename[10:12])
+        compressed_start = _off + 30 + file_name_length + extra_field_length
+        compressed_end = compressed_start + compressed_size
+
+        metadata_file_resp = self.session.get(url, headers={
+            'Range': f'bytes={compressed_start}-{compressed_end}',
+        })
+        metadata_file_resp.raise_for_status()
+
+        if len(metadata_file_resp.content) == len(local_file_header_resp.content):
+            metadata_file_bytes = metadata_file_resp.content[compressed_start:compressed_end]
+        else:
+            metadata_file_bytes = metadata_file_resp.content[:compressed_size]
+        uncompressed_file_contents = _inflate(metadata_file_bytes)
+        assert len(uncompressed_file_contents) == uncompressed_size
+
+        decoded_metadata_file = uncompressed_file_contents.decode('utf-8')
+        all_requirements = [
+            Requirement(re.sub(r'^(.*) \((.*)\)$', r'\1\2', g[1]))
+            for g in re.finditer(r'^Requires-Dist: (.*)$', decoded_metadata_file, flags=re.MULTILINE)
+        ]
+        return [
+            InstallRequirement(
+                req=r,
+                comes_from=req,
+            ) for r in all_requirements
+        ]
+
     def _resolve_one(
         self,
         requirement_set,  # type: RequirementSet
@@ -339,6 +491,15 @@ class Resolver(object):
         requirement_set.reqs_to_cleanup.append(req_to_install)
 
         abstract_dist = self._get_abstract_dist_for(req_to_install)
+
+        if not abstract_dist.has_been_downloaded():
+            sub_reqs = self._hacky_extract_sub_reqs(abstract_dist.req)
+            req_to_install.force_eager_download = True
+            req_to_install.force_no_deps_downloaded = True
+            return [
+                req_to_install,
+                *sub_reqs,
+            ]
 
         # Parse and return dependencies
         dist = abstract_dist.get_pkg_resources_distribution()
@@ -380,7 +541,7 @@ class Resolver(object):
                     req_to_install, parent_req_name=None,
                 )
 
-            if not self.ignore_dependencies:
+            if (not self.ignore_dependencies) and (not req_to_install.force_no_deps_downloaded):
                 if req_to_install.extras:
                     logger.debug(
                         "Installing extra requirements: %r",

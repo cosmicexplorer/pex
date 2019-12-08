@@ -456,15 +456,16 @@ class RequirementPreparer(object):
             # installation.
             # FIXME: this won't upgrade when there's an existing
             # package unpacked in `req.source_dir`
-            if os.path.exists(os.path.join(req.source_dir, 'setup.py')):
-                raise PreviousBuildDirError(
-                    "pip can't proceed with requirements '{}' due to a"
-                    " pre-existing build directory ({}). This is "
-                    "likely due to a previous installation that failed"
-                    ". pip is being responsible and not assuming it "
-                    "can delete this. Please delete it and try again."
-                    .format(req, req.source_dir)
-                )
+
+            # if os.path.exists(os.path.join(req.source_dir, 'setup.py')):
+            #     raise PreviousBuildDirError(
+            #         "pip can't proceed with requirements '%s' due to a"
+            #         " pre-existing build directory (%s). This is "
+            #         "likely due to a previous installation that failed"
+            #         ". pip is being responsible and not assuming it "
+            #         "can delete this. Please delete it and try again."
+            #         % (req, req.source_dir)
+            #     )
 
             # Now that we have the real link, we can tell what kind of
             # requirements we have and raise some more informative errors

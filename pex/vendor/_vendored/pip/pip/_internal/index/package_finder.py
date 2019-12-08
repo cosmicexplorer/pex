@@ -553,6 +553,13 @@ class CandidateEvaluator(object):
         if not candidates:
             return None
 
+        maybe_zip_candidates = [
+            c for c in candidates
+            if c.link.is_wheel_file()
+        ]
+        if maybe_zip_candidates:
+            candidates = maybe_zip_candidates
+
         best_candidate = max(candidates, key=self._sort_key)
 
         # Log a warning per PEP 592 if necessary before returning.

@@ -66,7 +66,6 @@ class Pip(object):
     if cache:
       pip_args.extend(['--cache-dir', cache])
     else:
-      pip_args.append('--no-cache-dir')
 
     command = pip_args + args
     with ENV.strip().patch(PEX_ROOT=ENV.PEX_ROOT, PEX_VERBOSE=str(pex_verbosity)) as env:
@@ -127,7 +126,8 @@ class Pip(object):
                                    cache=None,
                                    build=True,
                                    manylinux=None,
-                                   use_wheel=True):
+                                   use_wheel=True,
+                                   quickly_parse_sub_requirements=False):
 
     target = target or DistributionTarget.current()
 
@@ -163,6 +163,9 @@ class Pip(object):
 
     if not use_wheel:
       download_cmd.extend(['--no-binary', ':all:'])
+
+    if quickly_parse_sub_requirements:
+      download_cmd.append('--quickly-parse-sub-requirements')
 
     if allow_prereleases:
       download_cmd.append('--pre')

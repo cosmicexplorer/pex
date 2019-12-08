@@ -20,7 +20,7 @@ from pex.compatibility import string
 from pex.executor import Executor
 from pex.jobs import Job, SpawnedJob, execute_parallel
 from pex.third_party.packaging import markers, tags
-from pex.third_party.pkg_resources import Distribution, Requirement
+from pex.ipex_compat import Distribution, Requirement
 from pex.tracer import TRACER
 from pex.util import CacheHelper
 from pex.variables import ENV

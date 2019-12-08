@@ -2415,4 +2415,3 @@ def _patch_usage():
 
 class EasyInstallDeprecationWarning(SetuptoolsDeprecationWarning):
     """Class for warning about deprecations in EasyInstall in SetupTools. Not ignored by default, unlike DeprecationWarning."""
-    

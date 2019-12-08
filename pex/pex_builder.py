@@ -14,7 +14,7 @@ from pex.finders import get_entry_point_from_console_script, get_script_from_dis
 from pex.interpreter import PythonInterpreter
 from pex.pex_info import PexInfo
 from pex.pip import get_pip
-from pex.third_party.pkg_resources import DefaultProvider, ZipProvider, get_provider
+from pex.ipex_compat import DefaultProvider, ZipProvider, get_provider
 from pex.tracer import TRACER
 from pex.util import CacheHelper, DistributionHelper
 
@@ -364,13 +364,15 @@ class PEXBuilder(object):
 
   def _prepare_bootstrap(self):
     from . import vendor
-    vendor.vendor_runtime(chroot=self._chroot,
-                          dest_basedir=BOOTSTRAP_DIR,
-                          label='bootstrap',
-                          # NB: We use pip here in the builder, but that's only at buildtime and
-                          # although we don't use pyparsing directly, packaging.markers, which we
-                          # do use at runtime, does.
-                          root_module_names=['packaging', 'pkg_resources', 'pyparsing'])
+
+    try:
+      vendor.vendor_runtime(chroot=self._chroot,
+                            dest_basedir=BOOTSTRAP_DIR,
+                            label='bootstrap',
+                            # NB: We use wheel here in the builder, but that's only at build-time.
+                            root_module_names=['packaging', 'pkg_resources', 'pyparsing'])
+    except ValueError:
+      pass
 
     source_name = 'pex'
     provider = get_provider(source_name)

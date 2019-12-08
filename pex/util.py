@@ -11,7 +11,7 @@ from site import makepath
 
 from pex.common import atomic_directory, safe_mkdir, safe_mkdtemp
 from pex.compatibility import exec_function
-from pex.third_party.pkg_resources import (
+from pex.ipex_compat import (
     find_distributions,
     resource_isdir,
     resource_listdir,

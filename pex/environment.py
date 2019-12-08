@@ -18,7 +18,13 @@ from pex.interpreter import PythonInterpreter
 from pex.orderedset import OrderedSet
 from pex.platforms import Platform
 from pex.third_party.packaging import tags
-from pex.third_party.pkg_resources import DistributionNotFound, Environment, Requirement, WorkingSet
+from pex.ipex_compat import (
+    DistributionNotFound,
+    Environment,
+    Requirement,
+    WorkingSet,
+    find_distributions
+)
 from pex.tracer import TRACER
 from pex.util import CacheHelper, DistributionHelper
 

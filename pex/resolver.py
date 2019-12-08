@@ -20,7 +20,7 @@ from pex.pex_info import PexInfo
 from pex.pip import get_pip
 from pex.platforms import Platform
 from pex.requirements import local_project_from_requirement, local_projects_from_requirement_file
-from pex.third_party.pkg_resources import Distribution, Environment, Requirement
+from pex.ipex_compat import Distribution, Environment, Requirement
 from pex.tracer import TRACER
 from pex.util import CacheHelper
 
@@ -330,8 +330,8 @@ class ResolveRequest(object):
                build=True,
                use_wheel=True,
                compile=False,
-               manylinux=None,
-               max_parallel_jobs=None):
+               max_parallel_jobs=None,
+               quickly_parse_sub_requirements=False):
 
     self._targets = targets
     self._requirements = requirements
@@ -347,6 +347,7 @@ class ResolveRequest(object):
     self._compile = compile
     self._manylinux = manylinux
     self._max_parallel_jobs = max_parallel_jobs
+    self._quickly_parse_sub_requirements = quickly_parse_sub_requirements
 
   def _iter_local_projects(self):
     if self._requirements:
@@ -387,6 +388,7 @@ class ResolveRequest(object):
       build=self._build,
       manylinux=self._manylinux,
       use_wheel=self._use_wheel
+      quickly_parse_sub_requirements=self._quickly_parse_sub_requirements,
     )
     return SpawnedJob.wait(job=download_job, result=ResolveResult(target, download_dir))
 
@@ -634,7 +636,9 @@ def resolve(requirements=None,
             compile=False,
             manylinux=None,
             max_parallel_jobs=None,
-            ignore_errors=False):
+            ignore_errors=False,
+            max_parallel_jobs=None,
+            quickly_parse_sub_requirements=False):
   """Produce all distributions needed to meet all specified requirements.
 
   :keyword requirements: A sequence of requirement strings.
@@ -694,7 +698,8 @@ def resolve(requirements=None,
                                    use_wheel=use_wheel,
                                    compile=compile,
                                    manylinux=manylinux,
-                                   max_parallel_jobs=max_parallel_jobs)
+                                   max_parallel_jobs=max_parallel_jobs,
+                                   quickly_parse_sub_requirements=quickly_parse_sub_requirements)
 
   return list(resolve_request.resolve_distributions(ignore_errors=ignore_errors))
 
@@ -714,7 +719,8 @@ def resolve_multi(requirements=None,
                   compile=False,
                   manylinux=None,
                   max_parallel_jobs=None,
-                  ignore_errors=False):
+                  ignore_errors=False,
+                  quickly_parse_sub_requirements=False):
   """A generator function that produces all distributions needed to meet `requirements`
   for multiple interpreters and/or platforms.
 
@@ -796,6 +802,7 @@ def resolve_multi(requirements=None,
                                    use_wheel=use_wheel,
                                    compile=compile,
                                    manylinux=manylinux,
-                                   max_parallel_jobs=max_parallel_jobs)
+                                   max_parallel_jobs=max_parallel_jobs,
+                                   quickly_parse_sub_requirements=quickly_parse_sub_requirements)
 
   return list(resolve_request.resolve_distributions(ignore_errors=ignore_errors))

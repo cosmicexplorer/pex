@@ -190,7 +190,10 @@ class VendorImporter(object):
     :type expose: list of str
     :raise: :class:`ValueError` if any distributions to expose cannot be found.
     """
-    from pex import vendor
+    try:
+      from pex import vendor
+    except ImportError:
+      return
 
     root = cls._abs_root(root)
     vendored_path_items = [spec.relpath for spec in vendor.iter_vendor_specs()]
@@ -256,7 +259,10 @@ class VendorImporter(object):
                         importer.
     :return:
     """
-    root = cls._abs_root(root)
+    try:
+      root = cls._abs_root(root)
+    except ImportError:
+      return
     importables = tuple(cls._iter_importables(root=root, path_items=path_items, prefix=prefix))
     vendor_importer = cls(root=root,
                           importables=importables,

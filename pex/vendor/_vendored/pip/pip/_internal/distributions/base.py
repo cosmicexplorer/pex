@@ -34,6 +34,9 @@ class AbstractDistribution(object):
         super(AbstractDistribution, self).__init__()
         self.req = req
 
+    def has_been_downloaded(self):
+        return True
+
     @abc.abstractmethod
     def get_pkg_resources_distribution(self):
         # type: () -> Optional[Distribution]

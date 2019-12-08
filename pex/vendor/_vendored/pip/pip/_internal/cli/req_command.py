@@ -196,7 +196,8 @@ class RequirementCommand(IndexGroupCommand):
         force_reinstall=False,               # type: bool
         upgrade_strategy="to-satisfy-only",  # type: str
         use_pep517=None,                     # type: Optional[bool]
-        py_version_info=None            # type: Optional[Tuple[int, ...]]
+        py_version_info=None,            # type: Optional[Tuple[int, ...]]
+        quickly_parse_sub_requirements=False, # type: bool
     ):
         # type: (...) -> Resolver
         """
@@ -219,6 +220,7 @@ class RequirementCommand(IndexGroupCommand):
             force_reinstall=force_reinstall,
             upgrade_strategy=upgrade_strategy,
             py_version_info=py_version_info,
+            quickly_parse_sub_requirements=quickly_parse_sub_requirements,
         )
 
     def populate_requirement_set(

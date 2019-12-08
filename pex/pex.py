@@ -8,7 +8,11 @@ import sys
 from distutils import sysconfig
 from site import USER_SITE
 
-import pex.third_party.pkg_resources as pkg_resources
+try:
+  import pex.third_party.pkg_resources as pkg_resources
+except ModuleNotFoundError:
+  import pkg_resources
+
 from pex import third_party
 from pex.bootstrap import Bootstrap
 from pex.common import die
@@ -18,7 +22,7 @@ from pex.finders import get_entry_point_from_console_script, get_script_from_dis
 from pex.interpreter import PythonInterpreter
 from pex.orderedset import OrderedSet
 from pex.pex_info import PexInfo
-from pex.third_party.pkg_resources import EntryPoint, WorkingSet, find_distributions
+from pex.ipex_compat import EntryPoint, WorkingSet, find_distributions
 from pex.tracer import TRACER
 from pex.util import iter_pth_paths, named_temporary_file
 from pex.variables import ENV

@@ -119,7 +119,8 @@ class InstallRequirement(object):
         options=None,  # type: Optional[Dict[str, Any]]
         wheel_cache=None,  # type: Optional[WheelCache]
         constraint=False,  # type: bool
-        extras=()  # type: Iterable[str]
+        extras=(),         # type: Iterable[str]
+        force_eager_download=False, # type: bool
     ):
         # type: (...) -> None
         assert req is None or isinstance(req, Requirement), req
@@ -193,6 +194,9 @@ class InstallRequirement(object):
         # Setting an explicit value before loading pyproject.toml is supported,
         # but after loading this flag should be treated as read only.
         self.use_pep517 = use_pep517
+
+        self.force_eager_download = force_eager_download
+        self.force_no_deps_downloaded = force_eager_download
 
     def __str__(self):
         # type: () -> str
