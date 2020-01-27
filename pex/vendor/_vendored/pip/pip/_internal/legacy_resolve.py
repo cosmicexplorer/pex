@@ -15,18 +15,21 @@ for sub-dependencies
 # mypy: disallow-untyped-defs=False
 
 import logging
+import queue
 import re
 import struct
 import sys
 import zlib
 from collections import defaultdict
+from contextlib import contextmanager
 from itertools import chain
+from threading import Thread
+from typing import Any
 
-from pip._vendor.packaging import specifiers
+from pip._vendor.packaging import specifiers, version
 from pip._vendor.packaging.requirements import Requirement
 
 from pip._internal.distributions.base import AbstractDistribution
-from pip._internal.download import get_url_scheme
 from pip._internal.exceptions import (
     BestVersionAlreadyInstalled,
     DistributionNotFound,
@@ -35,6 +38,7 @@ from pip._internal.exceptions import (
     UnsupportedPythonVersion,
 )
 from pip._internal.req.req_install import InstallRequirement
+from pip._internal.req.req_set import VersionConflictError
 from pip._internal.utils.logging import indent_log
 from pip._internal.utils.misc import (
     dist_in_usersite,
@@ -46,6 +50,7 @@ from pip._internal.utils.packaging import (
     get_requires_python,
 )
 from pip._internal.utils.typing import MYPY_CHECK_RUNNING
+from pip._internal.util.urls import get_url_scheme
 
 if MYPY_CHECK_RUNNING:
     from typing import Callable, DefaultDict, List, Optional, Set, Tuple
@@ -146,11 +151,200 @@ def _decode_2_byte_unsigned(byte_string):
     return struct.unpack('<H', byte_string)[0]
 
 
+class _RequirementSubset(object):
+    """A component of the concurrent sub-global resolves used with quickly_parse_sub_requirements=True."""
+
+    def __init__(self, priority, item):
+        self.priority = priority
+        self.item = item
+
+    def __lt__(self, other):
+        assert isinstance(other, _RequirementSubset)
+        return self.priority < other.priority
+
+    @classmethod
+    def create(cls, req_set, *args):
+        return cls(priority=req_set.rank(),
+                   item=((req_set,) + args))
+
+
+class _MetadataResolveMapping(object):
+    """Keep an updated, ordered mapping of all transitively resolved requirements."""
+
+    def __init__(self, resolver):
+        self._resolver = resolver
+        # See https://docs.python.org/3/library/queue.html#queue.PriorityQueue!
+        self._without_links = queue.PriorityQueue()
+        self._with_links = queue.PriorityQueue()
+        self._inflight = queue.PriorityQueue()
+        self._completing = queue.Queue(maxsize=1)
+        self._subthread_errors = []
+        self._failed_resolves = []
+        self._successes = queue.Queue()
+
+        self._num_iterations = 0
+
+    def _wrap_subthread_fn(self, indentation, invoke_fn, requirement_set, req):
+        from pip._internal.utils.logging import _log_state
+        _log_state.indentation = indentation
+
+        try:
+            invoke_fn(requirement_set, req)
+        except Exception as e:
+            self._subthread_errors.append((requirement_set, req, e))
+        finally:
+            self._completing.put(())
+
+    def _populate_link(self, requirement_set, req):
+        assert not req.link
+        logger.warn(f'(#{self._num_iterations}) populating link for req {req} in {requirement_set}')
+
+        # We're collapsing the waveform in this thread. Make a copy in order to avoid making greedy
+        # decisions, with a link back to the parent requirement set.
+        requirement_set = requirement_set.copy()
+        # req = req.copy()
+
+        # Tell user what we are doing for this requirement:
+        # obtain (editable), skipping, processing (local url), collecting
+        # (remote url or package name)
+        if req.constraint or req.prepared:
+            return
+
+        req.prepared = True
+
+        # register tmp src for cleanup in case something goes wrong
+        requirement_set.reqs_to_cleanup.append(req)
+
+        assert self._resolver.require_hashes is not None, (
+            "require_hashes should have been set in Resolver.resolve()"
+        )
+
+        if req.editable:
+            return self._resolver.preparer.prepare_editable_requirement(
+                req, self._resolver.require_hashes, self._resolver.use_user_site,
+                self._resolver.finder)
+
+        # satisfied_by is only evaluated by calling _check_skip_installed,
+        # so it must be None here.
+        assert req.satisfied_by is None
+        skip_reason = self._resolver._check_skip_installed(req)
+
+        if req.satisfied_by:
+            return self._resolver.preparer.prepare_installed_requirement(
+                req, self._resolver.require_hashes, skip_reason
+            )
+
+        upgrade_allowed = self._resolver._is_upgrade_allowed(req)
+
+        # We eagerly populate the link, since that's our "legacy" behavior.
+        req.populate_link(self._resolver.finder, upgrade_allowed, self._resolver.require_hashes)
+        assert req.link
+
+        self._with_links.put_nowait(_RequirementSubset.create(requirement_set, req))
+
+    def _make_inflight_waiter_thread(self):
+        def wait_to_extract_thread():
+            while True:
+                try:
+                    entry = self._inflight.get()
+                    req_set, req, inflight_thread = entry.item
+                    logger.warn(f'priority: {entry.priority}, item: {entry.item}')
+
+                    # Check that it hasn't been started yet.
+                    assert inflight_thread.ident is None
+                    inflight_thread.start()
+
+                    _ = self._completing.get()
+                except (DistributionNotFound, VersionConflictError) as e:
+                    self._failed_resolves.append((req_set, req, e))
+                except Exception as e:
+                    self._subthread_errors.append((item, e))
+        return Thread(name=f'waiter for the in-flight queue!',
+                      target=wait_to_extract_thread,
+                      daemon=True)
+
+    def _toplevel_event_loop(self):
+        waiter_thread = self._make_inflight_waiter_thread()
+        # We leak this thread.
+        waiter_thread.start()
+
+        while True:
+            self._num_iterations += 1
+            if self._subthread_errors:
+                # NB: This just gets the most recent of the errors!
+                req_set, req, e = self._subthread_errors.pop()
+                raise Exception(f'failed to resolve {req} from {req_set}: {e}') from e
+
+            try:
+                while True:
+                    yield self._successes.get_nowait()
+            except queue.Empty:
+                pass
+
+            try:
+                while True:
+                    req_set, no_link_req = self._without_links.get_nowait().item
+                    from pip._internal.utils.logging import _log_state
+                    link_thread = Thread(name=f'pip populate link background thread: {no_link_req} for {req_set}',
+                                         target=self._wrap_subthread_fn,
+                                         args=(
+                                             _log_state.indentation,
+                                             self._populate_link,
+                                             req_set,
+                                             no_link_req,
+                                         ),
+                                         daemon=True)
+                    self._inflight.put(_RequirementSubset.create(req_set, no_link_req, link_thread))
+            except queue.Empty:
+                pass
+
+            try:
+                while True:
+                    req_set, link_req = self._with_links.get_nowait().item
+                    from pip._internal.utils.logging import _log_state
+                    resolve_thread = Thread(name=f'pip resolve background thread: {link_req} for {req_set}',
+                                            target=self._wrap_subthread_fn,
+                                            args=(
+                                                _log_state.indentation,
+                                                self._spawn_subjob,
+                                                req_set,
+                                                link_req,
+                                            ),
+                                            daemon=True)
+                    self._inflight.put(_RequirementSubset.create(req_set, link_req, resolve_thread))
+            except queue.Empty:
+                pass
+
+    def _accept_new_reqs(self, requirement_set, reqs):
+        for root_req in reqs:
+            if root_req.name in ['functools32', 'nodeenv']:
+                continue
+            if root_req.force_eager_download:
+                assert root_req.link
+                # NB: this is where we would download the wheels in a pipelined resolve + fetch, but
+                # we just want the transitive requirements.
+            else:
+              assert not root_req.link
+              self._without_links.put_nowait(_RequirementSubset.create(requirement_set, root_req))
+
+        if requirement_set.resolve_has_been_completed():
+            self._successes.put(requirement_set)
+
+    def _spawn_subjob(self, req_set, link_req):
+        logger.warn(f'(#{self._num_iterations}) resolving linked req {link_req} in {req_set}')
+        self._accept_new_reqs(req_set, self._resolver._resolve_one(req_set.copy(), link_req.copy()))
+
+    def iterate_until_fully_resolved(self, requirement_set):
+        self._accept_new_reqs(requirement_set, requirement_set.as_root_reqs())
+
+        yield from self._toplevel_event_loop()
+
+
 class MetadataOnlyResolveException(Exception):
-    """???"""
+    """Exception used for control flow to return a result quickly to a user of pip-as-a-library!"""
 
     def __init__(self, requirements):
-        super().__init__()
+        super().__init__(f'resolved requirements: {requirements}')
         self.requirements = requirements
 
 
@@ -220,33 +414,31 @@ class Resolver(object):
 
         # If any top-level requirement has a hash specified, enter
         # hash-checking mode, which requires hashes from all.
-        root_reqs = (
-            requirement_set.unnamed_requirements +
-            list(requirement_set.requirements.values())
-        )
+
+        root_reqs = requirement_set.as_root_reqs()
+
+        # Display where finder is looking for packages
+        search_scope = self.finder.search_scope
+        locations = search_scope.get_formatted_locations()
+        if locations:
+            logger.info(locations)
 
         # Actually prepare the files, and collect any exceptions. Most hash
         # exceptions cannot be checked ahead of time, because
         # req.populate_link() needs to be called before we can make decisions
         # based on link type.
-        discovered_reqs = []  # type: List[InstallRequirement]
-        forced_eager_recs = []
+        discovered_reqs = []    # type: List[InstallRequirement]
         hash_errors = HashErrors()
 
-        found_reqs = set()
+        if self.quickly_parse_sub_requirements:
+            metadata_mapping = _MetadataResolveMapping(self)
+            for completed_req_set in metadata_mapping.iterate_until_fully_resolved(requirement_set):
+                raise MetadataOnlyResolveException(completed_req_set.as_root_reqs())
+            raise ValueError(f'only found failures: {metadata_mapping._failed_resolves}')
 
-        for req in chain(root_reqs, discovered_reqs, forced_eager_recs):
-            if req.name in found_reqs:
-                continue
-            found_reqs.add(req.name)
+        for req in chain(root_reqs, discovered_reqs):
             try:
-                for r in self._resolve_one(requirement_set, req):
-                    if r.name == 'functools32':
-                        continue
-                    if r.force_eager_download:
-                        forced_eager_recs.append(r)
-                    else:
-                        discovered_reqs.append(r)
+                discovered_reqs.extend(self._resolve_one(requirement_set, req))
             except HashError as exc:
                 exc.req = req
                 hash_errors.append(exc)
@@ -355,7 +547,7 @@ class Resolver(object):
 
         # If we've been configured to hack out the METADATA file from a remote wheel, extract sub
         # requirements first!
-        if self.quickly_parse_sub_requirements and (not req.force_eager_download) and req.link.is_wheel_file():
+        if self.quickly_parse_sub_requirements and (not req.force_eager_download) and req.link.is_wheel:
             return LazyDistribution(req)
 
         abstract_dist = self.preparer.prepare_linked_requirement(req)
@@ -454,7 +646,13 @@ class Resolver(object):
             metadata_file_bytes = metadata_file_resp.content[compressed_start:compressed_end]
         else:
             metadata_file_bytes = metadata_file_resp.content[:compressed_size]
-        uncompressed_file_contents = _inflate(metadata_file_bytes)
+
+        try:
+            uncompressed_file_contents = _inflate(metadata_file_bytes)
+        except zlib.error as e:
+            logger.exception(e)
+            import pdb; pdb.set_trace()
+
         assert len(uncompressed_file_contents) == uncompressed_size
 
         decoded_metadata_file = uncompressed_file_contents.decode('utf-8')
@@ -463,10 +661,10 @@ class Resolver(object):
             for g in re.finditer(r'^Requires-Dist: (.*)$', decoded_metadata_file, flags=re.MULTILINE)
         ]
         return [
-            InstallRequirement(
-                req=r,
+            self._make_install_req(
+                str(subreq),
                 comes_from=req,
-            ) for r in all_requirements
+            ) for subreq in all_requirements
         ]
 
     def _resolve_one(
@@ -495,11 +693,12 @@ class Resolver(object):
         if not abstract_dist.has_been_downloaded():
             sub_reqs = self._hacky_extract_sub_reqs(abstract_dist.req)
             req_to_install.force_eager_download = True
-            req_to_install.force_no_deps_downloaded = True
             return [
-                req_to_install,
                 *sub_reqs,
+                req_to_install,
             ]
+
+        abstract_dist.req.has_backing_dist = True
 
         # Parse and return dependencies
         dist = abstract_dist.get_pkg_resources_distribution()
@@ -541,7 +740,7 @@ class Resolver(object):
                     req_to_install, parent_req_name=None,
                 )
 
-            if (not self.ignore_dependencies) and (not req_to_install.force_no_deps_downloaded):
+            if (not self.ignore_dependencies) and (not req_to_install.force_eager_download):
                 if req_to_install.extras:
                     logger.debug(
                         "Installing extra requirements: %r",

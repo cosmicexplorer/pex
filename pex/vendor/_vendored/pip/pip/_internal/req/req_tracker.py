@@ -106,6 +106,14 @@ class RequirementTracker(object):
         try:
             with open(entry_path) as fp:
                 contents = fp.read()
+                if contents != info:
+                    logger.debug(
+                        '%s is already being built, with different info: %s (was: %s)',
+                        link, info, contents)
+                assert req not in self._entries
+                self._entries.add(req)
+                logger.debug('Added (concurrently-being-built!) %s to build tracker %r',
+                             req, self._root)
         except IOError as e:
             # if the error is anything other than "file does not exist", raise.
             if e.errno != errno.ENOENT:
@@ -132,7 +140,10 @@ class RequirementTracker(object):
         # Delete the created file and the corresponding entries.
         os.unlink(self._entry_path(req.link))
         self._entries.remove(req)
-
+        try:
+            os.unlink(self._entry_path(link))
+        except FileNotFoundError:
+            pass
         logger.debug('Removed %s from build tracker %r', req, self._root)
 
     def cleanup(self):

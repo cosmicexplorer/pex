@@ -63,12 +63,6 @@ class Link(KeyBasedCompareMixin):
 
         super(Link, self).__init__(key=url, defining_class=Link)
 
-    def is_wheel_file(self):
-        return any(
-            ext in str(self)
-            for ext in ['.whl#', '.WHL#']
-        )
-
     def __str__(self):
         # type: () -> str
         if self.requires_python:

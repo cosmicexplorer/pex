@@ -6,6 +6,7 @@ from __future__ import absolute_import
 import logging
 from collections import OrderedDict
 
+from pip._vendor.packaging import specifiers, version
 from pip._vendor.packaging.utils import canonicalize_name
 
 from pip._internal import pep425tags
@@ -22,10 +23,136 @@ if MYPY_CHECK_RUNNING:
 logger = logging.getLogger(__name__)
 
 
+class VersionConflictError(Exception):
+    def __init__(self, conflicting_versions):
+        super().__init__(f'conflicting versions were: {conflicting_versions}')
+        self.conflicting_versions = conflicting_versions
+
+
+class EqualsMismatchException(VersionConflictError):
+    pass
+
+
+class InvalidEqualityAndInequality(VersionConflictError):
+    pass
+
+
+class InvalidLeftRightBounds(VersionConflictError):
+    pass
+
+
 class RequirementSet(object):
 
-    def __init__(self, check_supported_wheels=True):
-        # type: (bool) -> None
+    def rank(self):
+        root_reqs = self.as_root_reqs()
+
+        link_score = len(list(r for r in root_reqs if r.link))
+        wheel_score = len(list(r for r in root_reqs if r.link and r.link.is_wheel))
+        backing_dist_score = len(list(r for r in root_reqs if r.has_backing_dist))
+
+        parents_score = len(self.parents)
+
+        total = link_score + wheel_score + backing_dist_score + parents_score
+        # NB: We only have increasing scores, but queue.PriorityQueue takes the lowest priority, not
+        # highest! If the scores don't get too high, we can safely just subtract from some large
+        # number.
+        assert 300 > (total + 100)
+        return 300 - total
+
+    def resolve_has_been_completed(self):
+        # type: () -> bool
+        return all(r.has_backing_dist for r in self.as_root_reqs())
+
+    @staticmethod
+    def _minimize_versions(op, versions):
+        first, rest = versions[0], versions[1:]
+        for v in rest:
+          if op in ['<', '<=']:
+              if v < first:
+                  first = v
+          elif op in ['>', '>=']:
+              if v > first:
+                  first = v
+          else:
+              assert op == '=='
+              if v !=  first:
+                  raise EqualsMismatchException(versions)
+        return first
+
+    @staticmethod
+    def _find_representative_specifier_set(op_pairs):
+        equals_bound = op_pairs.get('==', None)
+
+        right_bound = None
+        right_op = None
+        lt_ver = op_pairs.get('<', None)
+        if lt_ver:
+            if equals_bound and lt_ver >= equals_bound:
+                raise InvalidEqualityAndInequality(list(op_pairs.items()))
+            right_bound = lt_ver
+            right_op = '<'
+        lte_ver = op_pairs.get('<=', None)
+        if lte_ver:
+            if equals_bound and lte_ver > equals_bound:
+                raise InvalidEqualityAndInequality(list(op_pairs.items()))
+            if right_bound and lte_ver < right_bound:
+                right_bound = lte_ver
+                right_op = '<='
+
+        left_bound = None
+        left_op = None
+        gt_ver = op_pairs.get('>', None)
+        if gt_ver:
+            if equals_bound and gt_ver <= equals_bound:
+                raise InvalidEqualityAndInequality(list(op_pairs.items()))
+            left_bound = gt_ver
+            left_op = '>'
+        gte_ver = op_pairs.get('>=', None)
+        if gte_ver:
+            if equals_bound and gte_ver < equals_bound:
+                raise InvalidEqualityAndInequality(list(op_pairs.items()))
+            if left_bound and gte_ver > left_bound:
+                left_bound = gte_ver
+                left_op = '>='
+
+        if (right_op == '<=') and (left_op == '>='):
+            if right_bound == left_bound:
+                equals_bound = right_bound
+        if equals_bound:
+            return specifiers.SpecifierSet(f'=={equals_bound}')
+        if right_bound and left_bound and (right_bound < left_bound):
+            raise InvalidLeftRightBounds(list(op_pairs.items()))
+
+        specifiers = [
+            *([specifiers.Specifier(f'{left_op}{left_bound}')] if left_op else []),
+            *([specifiers.Specifier(f'{right_op}{right_bound}')] if right_op else []),
+        ]
+        return specifiers.SpecifierSet(specifiers)
+
+    @classmethod
+    def _normalize_specifier_set(cls, specifier_set):
+        by_dominating_operator = defaultdict(list)
+        for specifier in specifier_set:
+            by_dominating_operator[specifier.operator].append(version.parse(specifier.version))
+        minimized_version_op_pairs = {
+            op: cls._minimize_versions(op, versions)
+            for op, versions in by_dominating_operator.items()
+        }
+        return cls._find_representative_specifier_set(minimized_version_op_pairs)
+
+    def copy(self):
+        # type: () -> RequirementSet
+        ret = RequirementSet(require_hashes=self.require_hashes,
+                             check_supported_wheels=self.check_supported_wheels)
+        ret.requirements = self.requirements.copy()
+        ret.unnamed_requirements = self.unnamed_requirements.copy()
+        ret.successfully_downloaded = self.successfully_downloaded.copy()
+        ret.reqs_to_cleanup = self.reqs_to_cleanup.copy()
+        ret.parents = self.parents.copy() + [self]
+        return ret
+
+    def __init__(self, require_hashes=False, check_supported_wheels=True):
+        # type: (bool, bool) -> None
         """Create a RequirementSet.
         """
 
@@ -35,6 +162,8 @@ class RequirementSet(object):
         self.unnamed_requirements = []  # type: List[InstallRequirement]
         self.successfully_downloaded = []  # type: List[InstallRequirement]
         self.reqs_to_cleanup = []  # type: List[InstallRequirement]
+
+        self.parents = []       # type: List[RequirementSet]
 
     def __str__(self):
         # type: () -> str
@@ -69,6 +198,9 @@ class RequirementSet(object):
 
         project_name = canonicalize_name(install_req.name)
         self.requirements[project_name] = install_req
+
+    def as_root_reqs(self):
+        return self.unnamed_requirements + list(self.requirements.values())
 
     def add_requirement(
         self,
@@ -129,19 +261,6 @@ class RequirementSet(object):
         except KeyError:
             existing_req = None
 
-        has_conflicting_requirement = (
-            parent_req_name is None and
-            existing_req and
-            not existing_req.constraint and
-            existing_req.extras == install_req.extras and
-            existing_req.req.specifier != install_req.req.specifier
-        )
-        if has_conflicting_requirement:
-            raise InstallationError(
-                "Double requirement given: %s (already in %s, name=%r)"
-                % (install_req, existing_req, install_req.name)
-            )
-
         # When no existing requirement exists, add the requirement as a
         # dependency and it will be scanned again after.
         if not existing_req:
@@ -149,10 +268,24 @@ class RequirementSet(object):
             # We'd want to rescan this requirement later
             return [install_req], install_req
 
+        try:
+            normalized_specifier_set = self._normalize_specifier_set(
+                existing_req.req.specifier & install_req.req.specifier)
+        except VersionConflictError as e:
+            raise InstallationError(
+                "Version conflict error {e}: %s (already in %s, name=%r)"
+                % (install_req, existing_req, install_req.name)
+            ) from e
+
         # Assume there's no need to scan, and that we've already
         # encountered this for scanning.
-        if install_req.constraint or not existing_req.constraint:
+        if (install_req.constraint or
+            (not existing_req.constraint) or
+            # If we've made no change to the accepted specifiers, we don't need to consider
+            # re-scanning!
+            (normalized_specifier_set == existing_req.req.specifier)):
             return [], existing_req
+        existing_req.req.specifier = normalized_specifier_set
 
         does_not_satisfy_constraint = (
             install_req.link and
@@ -178,6 +311,7 @@ class RequirementSet(object):
             "Setting %s extras to: %s",
             existing_req, existing_req.extras,
         )
+
         # Return the existing requirement for addition to the parent and
         # scanning again.
         return [existing_req], existing_req

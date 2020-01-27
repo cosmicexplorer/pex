@@ -106,6 +106,24 @@ class InstallRequirement(object):
     installing the said requirement.
     """
 
+    def copy(self):
+      return InstallRequirement(
+          req=self.req,
+          comes_from=(self.comes_from.copy() if self.comes_from else None),
+          source_dir=self.source_dir,
+          editable=self.editable,
+          link=self.link,
+          markers=self.markers,
+          use_pep517=self.use_pep517,
+          isolated=self.isolated,
+          options=self.options.copy(),
+          wheel_cache=self._wheel_cache,
+          constraint=self.constraint,
+          extras=self.extras.copy(),
+          has_backing_dist=self.has_backing_dist,
+          force_eager_download=self.force_eager_download,
+      )
+
     def __init__(
         self,
         req,  # type: Optional[Requirement]
@@ -120,7 +138,8 @@ class InstallRequirement(object):
         wheel_cache=None,  # type: Optional[WheelCache]
         constraint=False,  # type: bool
         extras=(),         # type: Iterable[str]
-        force_eager_download=False, # type: bool
+        force_eager_download=False,
+        has_backing_dist=False,
     ):
         # type: (...) -> None
         assert req is None or isinstance(req, Requirement), req
@@ -195,8 +214,8 @@ class InstallRequirement(object):
         # but after loading this flag should be treated as read only.
         self.use_pep517 = use_pep517
 
+        self.has_backing_dist = has_backing_dist
         self.force_eager_download = force_eager_download
-        self.force_no_deps_downloaded = force_eager_download
 
     def __str__(self):
         # type: () -> str

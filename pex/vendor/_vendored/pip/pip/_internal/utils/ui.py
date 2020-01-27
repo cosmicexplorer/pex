@@ -88,7 +88,10 @@ class InterruptibleMixin(object):
         """
         super(InterruptibleMixin, self).__init__(*args, **kwargs)
 
-        self.original_handler = signal(SIGINT, self.handle_sigint)
+        try:
+            self.original_handler = signal(SIGINT, self.handle_sigint)
+        except ValueError:
+            self.original_handler = None
 
         # If signal() returns None, the previous handler was not installed from
         # Python, and we cannot restore it. This probably should not happen,
@@ -106,7 +109,10 @@ class InterruptibleMixin(object):
         normally, or gets interrupted.
         """
         super(InterruptibleMixin, self).finish()
-        signal(SIGINT, self.original_handler)
+        try:
+            signal(SIGINT, self.original_handler)
+        except ValueError:
+            pass
 
     def handle_sigint(self, signum, frame):
         """

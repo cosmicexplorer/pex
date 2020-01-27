@@ -555,7 +555,7 @@ class CandidateEvaluator(object):
 
         maybe_zip_candidates = [
             c for c in candidates
-            if c.link.is_wheel_file()
+            if c.link.is_wheel
         ]
         if maybe_zip_candidates:
             candidates = maybe_zip_candidates
@@ -751,7 +751,7 @@ class PackageFinder(object):
             # the reason contains non-ascii characters.
             #   Also, put the link at the end so the reason is more visible
             # and because the link string is usually very long.
-            logger.debug(u'Skipping link: %s: %s', reason, link)
+            # logger.debug(u'Skipping link: %s: %s', reason, link)
             self._logged_links.add(link)
 
     def get_install_candidate(self, link_evaluator, link):
