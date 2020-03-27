@@ -394,6 +394,7 @@ class CandidateEvaluator(object):
         allow_all_prereleases=False,  # type: bool
         specifier=None,       # type: Optional[specifiers.BaseSpecifier]
         hashes=None,          # type: Optional[Hashes]
+        quickly_parse_sub_requirements=False,  # type: bool
     ):
         # type: (...) -> CandidateEvaluator
         """Create a CandidateEvaluator object.
@@ -420,6 +421,7 @@ class CandidateEvaluator(object):
             prefer_binary=prefer_binary,
             allow_all_prereleases=allow_all_prereleases,
             hashes=hashes,
+            quickly_parse_sub_requirements=quickly_parse_sub_requirements,
         )
 
     def __init__(
@@ -430,6 +432,7 @@ class CandidateEvaluator(object):
         prefer_binary=False,  # type: bool
         allow_all_prereleases=False,  # type: bool
         hashes=None,                  # type: Optional[Hashes]
+        quickly_parse_sub_requirements=False,  # type: bool
     ):
         # type: (...) -> None
         """
@@ -442,6 +445,7 @@ class CandidateEvaluator(object):
         self._project_name = project_name
         self._specifier = specifier
         self._supported_tags = supported_tags
+        self.quickly_parse_sub_requirements = quickly_parse_sub_requirements
 
     def get_applicable_candidates(
         self,
@@ -553,6 +557,16 @@ class CandidateEvaluator(object):
         if not candidates:
             return None
 
+        # Prefer wheel files to other candidates if we have
+        # --quickly-parse-sub-requirements turned on.
+        if self.quickly_parse_sub_requirements:
+            maybe_zip_candidates = [
+                c for c in candidates
+                if c.link.is_wheel_file()
+            ]
+            if maybe_zip_candidates:
+                candidates = maybe_zip_candidates
+
         best_candidate = max(candidates, key=self._sort_key)
 
         # Log a warning per PEP 592 if necessary before returning.
@@ -605,6 +619,7 @@ class PackageFinder(object):
         format_control=None,  # type: Optional[FormatControl]
         candidate_prefs=None,         # type: CandidatePreferences
         ignore_requires_python=None,  # type: Optional[bool]
+        quickly_parse_sub_requirements=False,   # type: bool
     ):
         # type: (...) -> None
         """
@@ -633,6 +648,8 @@ class PackageFinder(object):
         # These are boring links that have already been logged somehow.
         self._logged_links = set()  # type: Set[Link]
 
+        self.quickly_parse_sub_requirements = quickly_parse_sub_requirements
+
     # Don't include an allow_yanked default value to make sure each call
     # site considers whether yanked releases are allowed. This also causes
     # that decision to be made explicit in the calling code, which helps
@@ -643,6 +660,7 @@ class PackageFinder(object):
         link_collector,      # type: LinkCollector
         selection_prefs,     # type: SelectionPreferences
         target_python=None,  # type: Optional[TargetPython]
+        quickly_parse_sub_requirements=False,   # type: bool
     ):
         # type: (...) -> PackageFinder
         """Create a PackageFinder.
@@ -668,6 +686,7 @@ class PackageFinder(object):
             allow_yanked=selection_prefs.allow_yanked,
             format_control=selection_prefs.format_control,
             ignore_requires_python=selection_prefs.ignore_requires_python,
+            quickly_parse_sub_requirements=quickly_parse_sub_requirements,
         )
 
     @property
@@ -859,6 +878,7 @@ class PackageFinder(object):
             allow_all_prereleases=candidate_prefs.allow_all_prereleases,
             specifier=specifier,
             hashes=hashes,
+            quickly_parse_sub_requirements=self.quickly_parse_sub_requirements,
         )
 
     def find_best_candidate(

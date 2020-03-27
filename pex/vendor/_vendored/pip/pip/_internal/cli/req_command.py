@@ -9,11 +9,12 @@ import logging
 import os
 from functools import partial
 
+from pip._internal.cli import cmdoptions
 from pip._internal.cli.base_command import Command
 from pip._internal.cli.command_context import CommandContextMixIn
 from pip._internal.exceptions import CommandError
 from pip._internal.index.package_finder import PackageFinder
-from pip._internal.legacy_resolve import Resolver
+from pip._internal.legacy_resolve import PersistentRequirementDependencyCache, Resolver
 from pip._internal.models.selection_prefs import SelectionPreferences
 from pip._internal.network.download import Downloader
 from pip._internal.network.session import PipSession
@@ -24,6 +25,7 @@ from pip._internal.req.constructors import (
     install_req_from_req_string,
 )
 from pip._internal.req.req_file import parse_requirements
+from pip._internal.req.req_set import RequirementSet
 from pip._internal.self_outdated_check import (
     make_link_collector,
     pip_self_version_check,
@@ -151,16 +153,23 @@ class IndexGroupCommand(Command, SessionCommandMixin):
 
 class RequirementCommand(IndexGroupCommand):
 
+    def __init__(self, *args, **kw):
+        # type: (Any, Any) -> None
+        super(RequirementCommand, self).__init__(*args, **kw)
+
+        self.cmd_opts.add_option(cmdoptions.quickly_parse_sub_requirements())
+
     @staticmethod
     def make_requirement_preparer(
-        temp_build_dir,           # type: TempDirectory
-        options,                  # type: Values
-        req_tracker,              # type: RequirementTracker
-        session,                  # type: PipSession
-        finder,                   # type: PackageFinder
-        use_user_site,            # type: bool
-        download_dir=None,        # type: str
-        wheel_download_dir=None,  # type: str
+        temp_build_dir,                        # type: TempDirectory
+        options,                               # type: Values
+        req_tracker,                           # type: RequirementTracker
+        session,                               # type: PipSession
+        finder,                                # type: PackageFinder
+        use_user_site,                         # type: bool
+        download_dir=None,                     # type: str
+        wheel_download_dir=None,               # type: str
+        quickly_parse_sub_requirements=False,  # type: bool
     ):
         # type: (...) -> RequirementPreparer
         """
@@ -182,6 +191,7 @@ class RequirementCommand(IndexGroupCommand):
             finder=finder,
             require_hashes=options.require_hashes,
             use_user_site=use_user_site,
+            quickly_parse_sub_requirements=quickly_parse_sub_requirements,
         )
 
     @staticmethod
@@ -196,7 +206,9 @@ class RequirementCommand(IndexGroupCommand):
         force_reinstall=False,               # type: bool
         upgrade_strategy="to-satisfy-only",  # type: str
         use_pep517=None,                     # type: Optional[bool]
-        py_version_info=None            # type: Optional[Tuple[int, ...]]
+        py_version_info=None,                # type: Optional[Tuple[int, ...]]
+        quickly_parse_sub_requirements=False,  # type: bool
+        session=None                         # type: Optional[PipSession]
     ):
         # type: (...) -> Resolver
         """
@@ -208,6 +220,13 @@ class RequirementCommand(IndexGroupCommand):
             wheel_cache=wheel_cache,
             use_pep517=use_pep517,
         )
+
+        persistent_cache_file = os.path.join(
+            options.cache_dir,
+            'requirement-link-dependency-cache.json')
+        persistent_dependency_cache = PersistentRequirementDependencyCache(
+            persistent_cache_file)
+
         return Resolver(
             preparer=preparer,
             finder=finder,
@@ -219,6 +238,9 @@ class RequirementCommand(IndexGroupCommand):
             force_reinstall=force_reinstall,
             upgrade_strategy=upgrade_strategy,
             py_version_info=py_version_info,
+            quickly_parse_sub_requirements=quickly_parse_sub_requirements,
+            session=session,
+            persistent_dependency_cache=persistent_dependency_cache,
         )
 
     def populate_requirement_set(
@@ -330,4 +352,6 @@ class RequirementCommand(IndexGroupCommand):
             link_collector=link_collector,
             selection_prefs=selection_prefs,
             target_python=target_python,
+            quickly_parse_sub_requirements=(
+                options.quickly_parse_sub_requirements),
         )

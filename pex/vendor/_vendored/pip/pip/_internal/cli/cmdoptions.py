@@ -691,6 +691,16 @@ def _handle_build_dir(option, opt, value, parser):
     setattr(parser.values, option.dest, value)
 
 
+quickly_parse_sub_requirements = partial(
+    Option,
+    '--quickly-parse-sub-requirements',
+    dest='quickly_parse_sub_requirements',
+    action='store_true',
+    default=False,
+    help='Enable an experimental mode to download more packages in parallel.',
+)  # type: Callable[..., Option]
+
+
 build_dir = partial(
     Option,
     '-b', '--build', '--build-dir', '--build-directory',

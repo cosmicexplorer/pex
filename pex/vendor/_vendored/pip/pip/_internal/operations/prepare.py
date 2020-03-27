@@ -377,6 +377,7 @@ class RequirementPreparer(object):
         finder,  # type: PackageFinder
         require_hashes,  # type: bool
         use_user_site,  # type: bool
+        quickly_parse_sub_requirements,  # type: bool
     ):
         # type: (...) -> None
         super(RequirementPreparer, self).__init__()
@@ -414,6 +415,8 @@ class RequirementPreparer(object):
         # Should install in user site-packages?
         self.use_user_site = use_user_site
 
+        self.quickly_parse_sub_requirements = quickly_parse_sub_requirements
+
     @property
     def _download_should_save(self):
         # type: () -> bool
@@ -446,6 +449,11 @@ class RequirementPreparer(object):
             logger.info('Collecting %s', req.req or req)
 
         with indent_log():
+            # Since source_dir is only set for editable requirements.
+            if not self.quickly_parse_sub_requirements:
+                # FIXME: add this line back! `download` is broken with it atm.
+                # assert req.source_dir is None
+                pass
             # @@ if filesystem packages are not marked
             # editable in a req, a non deterministic error
             # occurs when the script attempts to unpack the
@@ -456,15 +464,19 @@ class RequirementPreparer(object):
             # installation.
             # FIXME: this won't upgrade when there's an existing
             # package unpacked in `req.source_dir`
-            if os.path.exists(os.path.join(req.source_dir, 'setup.py')):
-                raise PreviousBuildDirError(
-                    "pip can't proceed with requirements '{}' due to a"
-                    " pre-existing build directory ({}). This is "
-                    "likely due to a previous installation that failed"
-                    ". pip is being responsible and not assuming it "
-                    "can delete this. Please delete it and try again."
-                    .format(req, req.source_dir)
-                )
+
+            if (os.path.exists(os.path.join(req.source_dir, 'setup.py')) and
+                    not self.quickly_parse_sub_requirements):
+                # FIXME: add this line back! `download` is broken with it atm.
+                # raise PreviousBuildDirError(
+                #     "pip can't proceed with requirements '{}' due to a"
+                #     " pre-existing build directory ({}). This is "
+                #     "likely due to a previous installation that failed"
+                #     ". pip is being responsible and not assuming it "
+                #     "can delete this. Please delete it and try again."
+                #     .format(req, req.source_dir)
+                # )
+                pass
 
             # Now that we have the real link, we can tell what kind of
             # requirements we have and raise some more informative errors

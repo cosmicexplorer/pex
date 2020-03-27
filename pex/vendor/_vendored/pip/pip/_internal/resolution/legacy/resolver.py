@@ -39,11 +39,7 @@ from pip._internal.req.req_install import InstallRequirement
 from pip._internal.resolution.base import BaseResolver
 from pip._internal.req.req_set import RequirementSet
 from pip._internal.utils.logging import indent_log
-from pip._internal.utils.misc import (
-    dist_in_usersite,
-    ensure_dir,
-    normalize_version_info,
-)
+from pip._internal.utils.misc import dist_in_usersite, normalize_version_info
 from pip._internal.utils.packaging import (
     check_requires_python,
     get_requires_python,
@@ -59,11 +55,8 @@ if MYPY_CHECK_RUNNING:
     from pip._internal.network.session import PipSession
     from pip._internal.operations.prepare import RequirementPreparer
     from pip._internal.req.req_install import InstallRequirement
-    from pip._internal.req.req_set import RequirementSet
+    from pip._internal.resolution.base import InstallRequirementProvider
 
-    InstallRequirementProvider = Callable[
-        [str, InstallRequirement], InstallRequirement
-    ]
     DiscoveredDependencies = DefaultDict[str, List[InstallRequirement]]
 
 
@@ -343,8 +336,8 @@ class Resolver(BaseResolver):
 
         self._persistent_dependency_cache = persistent_dependency_cache
 
-    def resolve(self, requirement_set):
-        # type: (RequirementSet) -> RequirementSet
+    def resolve(self, root_reqs, check_supported_wheels):
+        # type: (List[InstallRequirement], bool) -> RequirementSet
         """Resolve what operations need to be done
 
         As a side-effect of this method, the packages (and their dependencies)
@@ -356,6 +349,12 @@ class Resolver(BaseResolver):
         dependency resolution.
         """
         with self._persistent_dependency_cache as dep_cache:
+            requirement_set = RequirementSet(
+                check_supported_wheels=check_supported_wheels
+            )
+            for req in root_reqs:
+                requirement_set.add_requirement(req)
+
             # Actually prepare the files, and collect any exceptions. Most hash
             # exceptions cannot be checked ahead of time, because
             # req.populate_link() needs to be called before we can make
@@ -366,13 +365,13 @@ class Resolver(BaseResolver):
 
             found_reqs = set()  # type: Set[str]
 
-            root_reqs = requirement_set.all_requirements()
-
             for req in chain(root_reqs, discovered_reqs, forced_eager_reqs):
 
                 if (req.force_eager_download and
                         self.quickly_parse_sub_requirements):
                     continue
+
+                # import pdb; pdb.set_trace()
 
                 if req.name in found_reqs:
                     continue
@@ -802,7 +801,7 @@ class Resolver(BaseResolver):
                 # XXX: --no-install leads this to report 'Successfully
                 # downloaded' for only non-editable reqs, even though we took
                 # action on them.
-                requirement_set.successfully_downloaded.append(req_to_install)
+                req_to_install.successfully_downloaded = True
 
         return more_reqs
 
