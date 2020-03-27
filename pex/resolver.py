@@ -393,9 +393,9 @@ class ResolveRequest(object):
     ):
       yield result
 
-  def _spawn_resolve(self, resolved_dists_dir, target):
+  def _spawn_resolve(self, resolved_dists_dir, target, quickly_parse_sub_requirements=False):
     download_dir = os.path.join(resolved_dists_dir, target.id)
-    download_job = get_pip().spawn_download_distributions(
+    resolve_kwargs = dict(
       download_dir=download_dir,
       requirements=self._requirements,
       requirement_files=self._requirement_files,
@@ -410,7 +410,13 @@ class ResolveRequest(object):
       manylinux=self._manylinux,
       use_wheel=self._use_wheel
     )
-    return SpawnedJob.wait(job=download_job, result=ResolveResult(target, download_dir))
+
+    if quickly_parse_sub_requirements:
+      download_job = get_pip().spawn_quick_resolve_command(**resolve_kwargs)
+      return SpawnedJob.stdout(job=download_job, result_func=lambda stdout: stdout)
+    else:
+      download_job = get_pip().spawn_download_distributions(**resolve_kwargs)
+      return SpawnedJob.wait(job=download_job, result=ResolveResult(target, download_dir))
 
   def _categorize_build_requests(self, build_requests, dist_root):
     unsatisfied_build_requests = []
@@ -463,6 +469,20 @@ class ResolveRequest(object):
       target=install_request.target
     )
     return SpawnedJob.wait(job=install_job, result=install_result)
+
+  def resolve_dists_quickly_experimental(self):
+    assert len(self._targets) == 1
+    single_target = self._targets[0]
+
+    workspace = safe_mkdtemp()
+    cache = self._cache or workspace
+
+    resolved_dists_dir = os.path.join(workspace, 'resolved_dists')
+
+    resolve_command = self._spawn_resolve(resolved_dists_dir, single_target,
+                                          quickly_parse_sub_requirements=True)
+
+    resolve_command.await_result()
 
   def resolve_distributions(self, ignore_errors=False):
     # This method has four stages:
@@ -642,6 +662,80 @@ class ResolveRequest(object):
       )
 
 
+def resolve_quickly_experimental(requirements=None,
+                                 requirement_files=None,
+                                 constraint_files=None,
+                                 allow_prereleases=False,
+                                 transitive=True,
+                                 interpreter=None,
+                                 platform=None,
+                                 indexes=None,
+                                 find_links=None,
+                                 cache=None,
+                                 build=True,
+                                 use_wheel=True,
+                                 compile=False,
+                                 manylinux=None,
+                                 max_parallel_jobs=None,
+                                 ignore_errors=False):
+
+  resolve_request = _make_resolve_request(requirements=requirements,
+                                          requirement_files=requirement_files,
+                                          constraint_files=constraint_files,
+                                          allow_prereleases=allow_prereleases,
+                                          transitive=transitive,
+                                          interpreter=interpreter,
+                                          platform=platform,
+                                          indexes=indexes,
+                                          find_links=find_links,
+                                          cache=cache,
+                                          build=build,
+                                          use_wheel=use_wheel,
+                                          compile=compile,
+                                          manylinux=manylinux,
+                                          max_parallel_jobs=max_parallel_jobs,
+                                          ignore_errors=ignore_errors)
+
+  return resolve_request.resolve_dists_quickly_experimental()
+
+
+
+def _make_resolve_request(requirements=None,
+                          requirement_files=None,
+                          constraint_files=None,
+                          allow_prereleases=False,
+                          transitive=True,
+                          interpreter=None,
+                          platform=None,
+                          indexes=None,
+                          find_links=None,
+                          cache=None,
+                          build=True,
+                          use_wheel=True,
+                          compile=False,
+                          manylinux=None,
+                          max_parallel_jobs=None,
+                          ignore_errors=False):
+
+  target = DistributionTarget(interpreter=interpreter, platform=parsed_platform(platform))
+
+  return ResolveRequest(targets=[target],
+                        requirements=requirements,
+                        requirement_files=requirement_files,
+                        constraint_files=constraint_files,
+                        allow_prereleases=allow_prereleases,
+                        transitive=transitive,
+                        indexes=indexes,
+                        find_links=find_links,
+                        cache=cache,
+                        build=build,
+                        use_wheel=use_wheel,
+                        compile=compile,
+                        manylinux=manylinux,
+                        max_parallel_jobs=max_parallel_jobs)
+
+
+
 def resolve(requirements=None,
             requirement_files=None,
             constraint_files=None,
@@ -702,24 +796,114 @@ def resolve(requirements=None,
     a particular requirement.
   """
 
-  target = DistributionTarget(interpreter=interpreter, platform=parsed_platform(platform))
-
-  resolve_request = ResolveRequest(targets=[target],
-                                   requirements=requirements,
-                                   requirement_files=requirement_files,
-                                   constraint_files=constraint_files,
-                                   allow_prereleases=allow_prereleases,
-                                   transitive=transitive,
-                                   indexes=indexes,
-                                   find_links=find_links,
-                                   cache=cache,
-                                   build=build,
-                                   use_wheel=use_wheel,
-                                   compile=compile,
-                                   manylinux=manylinux,
-                                   max_parallel_jobs=max_parallel_jobs)
-
+  resolve_request = _make_resolve_request(requirements=requirements,
+                                          requirement_files=requirement_files,
+                                          constraint_files=constraint_files,
+                                          allow_prereleases=allow_prereleases,
+                                          transitive=transitive,
+                                          interpreter=interpreter,
+                                          platform=platform,
+                                          indexes=indexes,
+                                          find_links=find_links,
+                                          cache=cache,
+                                          build=build,
+                                          use_wheel=use_wheel,
+                                          compile=compile,
+                                          manylinux=manylinux,
+                                          max_parallel_jobs=max_parallel_jobs,
+                                          ignore_errors=ignore_errors)
   return list(resolve_request.resolve_distributions(ignore_errors=ignore_errors))
+
+
+def _make_resolve_multi_request(requirements=None,
+                                requirement_files=None,
+                                constraint_files=None,
+                                allow_prereleases=False,
+                                transitive=True,
+                                interpreters=None,
+                                platforms=None,
+                                indexes=None,
+                                find_links=None,
+                                cache=None,
+                                build=True,
+                                use_wheel=True,
+                                compile=False,
+                                manylinux=None,
+                                max_parallel_jobs=None,
+                                ignore_errors=False):
+
+  parsed_platforms = [parsed_platform(platform) for platform in platforms] if platforms else []
+
+  def iter_targets():
+    if not interpreters and not parsed_platforms:
+      # No specified targets, so just build for the current interpreter (on the current platform).
+      yield DistributionTarget.current()
+      return
+
+    if interpreters:
+      for interpreter in interpreters:
+        # Build for the specified local interpreters (on the current platform).
+        yield DistributionTarget.for_interpreter(interpreter)
+
+    if parsed_platforms:
+      for platform in parsed_platforms:
+        if platform is not None or not interpreters:
+          # 1. Build for specific platforms.
+          # 2. Build for the current platform (None) only if not done already (ie: no intepreters
+          #    were specified).
+          yield DistributionTarget.for_platform(platform)
+
+  return ResolveRequest(targets=list(iter_targets()),
+                        requirements=requirements,
+                        requirement_files=requirement_files,
+                        constraint_files=constraint_files,
+                        allow_prereleases=allow_prereleases,
+                        transitive=transitive,
+                        indexes=indexes,
+                        find_links=find_links,
+                        cache=cache,
+                        build=build,
+                        use_wheel=use_wheel,
+                        compile=compile,
+                        manylinux=manylinux,
+                        max_parallel_jobs=max_parallel_jobs)
+
+def resolve_multi_quickly_experimental(requirements=None,
+                                       requirement_files=None,
+                                       constraint_files=None,
+                                       allow_prereleases=False,
+                                       transitive=True,
+                                       interpreters=None,
+                                       platforms=None,
+                                       indexes=None,
+                                       find_links=None,
+                                       cache=None,
+                                       build=True,
+                                       use_wheel=True,
+                                       compile=False,
+                                       manylinux=None,
+                                       max_parallel_jobs=None,
+                                       ignore_errors=False):
+
+  resolve_request = _make_resolve_multi_request(requirements=requirements,
+                                                requirement_files=requirement_files,
+                                                constraint_files=constraint_files,
+                                                allow_prereleases=allow_prereleases,
+                                                transitive=transitive,
+                                                interpreters=interpreters,
+                                                platforms=platforms,
+                                                indexes=indexes,
+                                                find_links=find_links,
+                                                cache=cache,
+                                                build=build,
+                                                use_wheel=use_wheel,
+                                                compile=compile,
+                                                manylinux=manylinux,
+                                                max_parallel_jobs=max_parallel_jobs,
+                                                ignore_errors=ignore_errors)
+
+  return resolve_request.resolve_dists_quickly_experimental()
+
 
 
 def resolve_multi(requirements=None,
@@ -784,41 +968,21 @@ def resolve_multi(requirements=None,
   :raises Untranslateable: If no compatible distributions could be acquired for
     a particular requirement.
   """
-
-  parsed_platforms = [parsed_platform(platform) for platform in platforms] if platforms else []
-
-  def iter_targets():
-    if not interpreters and not parsed_platforms:
-      # No specified targets, so just build for the current interpreter (on the current platform).
-      yield DistributionTarget.current()
-      return
-
-    if interpreters:
-      for interpreter in interpreters:
-        # Build for the specified local interpreters (on the current platform).
-        yield DistributionTarget.for_interpreter(interpreter)
-
-    if parsed_platforms:
-      for platform in parsed_platforms:
-        if platform is not None or not interpreters:
-          # 1. Build for specific platforms.
-          # 2. Build for the current platform (None) only if not done already (ie: no intepreters
-          #    were specified).
-          yield DistributionTarget.for_platform(platform)
-
-  resolve_request = ResolveRequest(targets=list(iter_targets()),
-                                   requirements=requirements,
-                                   requirement_files=requirement_files,
-                                   constraint_files=constraint_files,
-                                   allow_prereleases=allow_prereleases,
-                                   transitive=transitive,
-                                   indexes=indexes,
-                                   find_links=find_links,
-                                   cache=cache,
-                                   build=build,
-                                   use_wheel=use_wheel,
-                                   compile=compile,
-                                   manylinux=manylinux,
-                                   max_parallel_jobs=max_parallel_jobs)
+  resolve_request = _make_resolve_multi_request(requirements=requirements,
+                                                requirement_files=requirement_files,
+                                                constraint_files=constraint_files,
+                                                allow_prereleases=allow_prereleases,
+                                                transitive=transitive,
+                                                interpreters=interpreters,
+                                                platforms=platforms,
+                                                indexes=indexes,
+                                                find_links=find_links,
+                                                cache=cache,
+                                                build=build,
+                                                use_wheel=use_wheel,
+                                                compile=compile,
+                                                manylinux=manylinux,
+                                                max_parallel_jobs=max_parallel_jobs,
+                                                ignore_errors=ignore_errors)
 
   return list(resolve_request.resolve_distributions(ignore_errors=ignore_errors))

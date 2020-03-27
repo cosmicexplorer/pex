@@ -25,7 +25,7 @@ from pex.pex import PEX
 from pex.pex_bootstrapper import iter_compatible_interpreters
 from pex.pex_builder import PEXBuilder
 from pex.platforms import Platform
-from pex.resolver import Unsatisfiable, parsed_platform, resolve_multi
+from pex.resolver import Unsatisfiable, parsed_platform, resolve_multi, resolve_multi_quickly_experimental
 from pex.tracer import TRACER
 from pex.variables import ENV, Variables
 from pex.version import __version__
@@ -233,11 +233,23 @@ def configure_clp_pex_resolution(parser):
   parser.add_option_group(group)
 
 
+class NoPexBuildEarlyExit(Exception):
+  """???"""
+
+
 def configure_clp_pex_options(parser):
   group = OptionGroup(
       parser,
       'PEX output options',
       'Tailor the behavior of the emitted .pex file if -o is specified.')
+
+  group.add_option(
+      '--resolve-dists-to-stdout',
+      dest='resolve_dists_to_stdout',
+      default=False,
+      action='callback',
+      callback=parse_bool,
+      help='[EXPERIMENTAL!] Whether to write pex resolve info to stdout instead of building a pex.')
 
   group.add_option(
       '--zip-safe', '--not-zip-safe',
@@ -600,23 +612,34 @@ def build_pex(reqs, options, cache=None):
     indexes = [str(index) for index in options.indexes]
 
   with TRACER.timed('Resolving distributions ({})'.format(reqs + options.requirement_files)):
+
+    resolve_kwargs = dict(
+      requirements=reqs,
+      requirement_files=options.requirement_files,
+      constraint_files=options.constraint_files,
+      allow_prereleases=options.allow_prereleases,
+      transitive=options.transitive,
+      interpreters=interpreters,
+      platforms=options.platforms,
+      indexes=indexes,
+      find_links=options.find_links,
+      cache=cache,
+      build=options.build,
+      use_wheel=options.use_wheel,
+      compile=options.compile,
+      manylinux=options.manylinux,
+      max_parallel_jobs=options.max_parallel_jobs,
+      ignore_errors=options.ignore_errors)
+
+    if options.resolve_dists_to_stdout:
+      try:
+        resolve_multi_quickly_experimental(**resolve_kwargs)
+        raise NoPexBuildEarlyExit
+      except Exception as e:
+        die(e)
+
     try:
-      resolveds = resolve_multi(requirements=reqs,
-                                requirement_files=options.requirement_files,
-                                constraint_files=options.constraint_files,
-                                allow_prereleases=options.allow_prereleases,
-                                transitive=options.transitive,
-                                interpreters=interpreters,
-                                platforms=options.platforms,
-                                indexes=indexes,
-                                find_links=options.find_links,
-                                cache=cache,
-                                build=options.build,
-                                use_wheel=options.use_wheel,
-                                compile=options.compile,
-                                manylinux=options.manylinux,
-                                max_parallel_jobs=options.max_parallel_jobs,
-                                ignore_errors=options.ignore_errors)
+      resolveds = resolve_multi(**resolve_kwargs)
 
       for resolved_dist in resolveds:
         log('  %s -> %s' % (resolved_dist.requirement, resolved_dist.distribution),
@@ -696,7 +719,10 @@ def main(args=None):
 
   with ENV.patch(PEX_VERBOSE=str(options.verbosity), PEX_ROOT=pex_root) as patched_env:
     with TRACER.timed('Building pex'):
-      pex_builder = build_pex(reqs, options, cache=ENV.PEX_ROOT)
+      try:
+        pex_builder = build_pex(reqs, options, cache=ENV.PEX_ROOT)
+      except NoPexBuildEarlyExit:
+        sys.exit(0)
 
     pex_builder.freeze(bytecode_compile=options.compile)
     pex = PEX(pex_builder.path(),
