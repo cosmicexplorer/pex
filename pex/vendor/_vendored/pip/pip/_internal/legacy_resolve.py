@@ -174,7 +174,7 @@ class PersistentRequirementDependencyCache(object):
             with open(self._file_path, 'rb') as f:
                 cache_from_config = RequirementDependencyCache.deserialize(
                     f.read())
-        except (OSError, EOFError) as e:
+        except (OSError, json.decoder.JSONDecodeError, EOFError) as e:
             # If the file does not exist, or the cache was not readable for any
             # reason, just start anew.
             logger.debug('error reading dependency cache: {}.'.format(e))
