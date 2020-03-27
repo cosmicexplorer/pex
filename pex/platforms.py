@@ -39,7 +39,7 @@ class Platform(namedtuple('Platform', ['platform', 'impl', 'version', 'abi'])):
           linux-x86_64-cp-37-cp37m
 
         Where the fields above are:
-        + <platform>: linux-x86_64 
+        + <platform>: linux-x86_64
         + <python impl abbr>: cp
         + <python version>: 37
         + <abi>: cp37m
@@ -74,9 +74,9 @@ class Platform(namedtuple('Platform', ['platform', 'impl', 'version', 'abi'])):
     return super(Platform, cls).__new__(cls, platform, impl, version, abi)
 
   @classmethod
-  def of_interpreter(cls, intepreter=None):
-    intepreter = intepreter or PythonInterpreter.get()
-    identity = intepreter.identity
+  def of_interpreter(cls, interpreter=None):
+    interpreter = interpreter or PythonInterpreter.get()
+    identity = interpreter.identity
     impl, version = identity.python_tag[:2], identity.python_tag[2:]
     return cls(platform=identity.platform_tag,
                impl=impl,

@@ -174,7 +174,7 @@ class CacheHelper(object):
               zf.extract(name, target_dir_tmp)
 
     dist = DistributionHelper.distribution_from_path(target_dir)
-    assert dist is not None, 'Failed to cache distribution '.format(source)
+    assert dist is not None, 'Failed to cache distribution {}'.format(source)
     return dist
 
 

@@ -482,7 +482,7 @@ class ResolveRequest(object):
     resolve_command = self._spawn_resolve(resolved_dists_dir, single_target,
                                           quickly_parse_sub_requirements=True)
 
-    resolve_command.await_result()
+    return resolve_command.await_result()
 
   def resolve_distributions(self, ignore_errors=False):
     # This method has four stages:

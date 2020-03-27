@@ -633,7 +633,7 @@ def build_pex(reqs, options, cache=None):
 
     if options.resolve_dists_to_stdout:
       try:
-        resolve_multi_quickly_experimental(**resolve_kwargs)
+        ret = resolve_multi_quickly_experimental(**resolve_kwargs)
         raise NoPexBuildEarlyExit
       except Exception as e:
         die(e)
