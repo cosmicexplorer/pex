@@ -15,6 +15,7 @@ from pip._internal.cli.command_context import CommandContextMixIn
 from pip._internal.exceptions import CommandError
 from pip._internal.index.package_finder import PackageFinder
 from pip._internal.legacy_resolve import PersistentRequirementDependencyCache, Resolver
+from pip._internal.locations import USER_CACHE_DIR
 from pip._internal.models.selection_prefs import SelectionPreferences
 from pip._internal.network.download import Downloader
 from pip._internal.network.session import PipSession
@@ -222,7 +223,7 @@ class RequirementCommand(IndexGroupCommand):
         )
 
         persistent_cache_file = os.path.join(
-            options.cache_dir,
+            USER_CACHE_DIR,
             'requirement-link-dependency-cache.json')
         persistent_dependency_cache = PersistentRequirementDependencyCache(
             persistent_cache_file)
