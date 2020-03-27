@@ -168,7 +168,9 @@ class ResolveCommand(RequirementCommand, SessionCommandMixin):
 
             self.trace_basic_info(finder)
 
-            completed_requirement_set = resolver.resolve(requirement_set)
+            completed_requirement_set = resolver.resolve(
+                requirement_set.requirements.values(),
+                check_supported_wheels=True)
 
         requirement_resolve_output_entries = []  # type: List[str]
         for req in completed_requirement_set.requirements.values():

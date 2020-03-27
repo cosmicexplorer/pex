@@ -182,11 +182,6 @@ class RequirementSet(object):
         # scanning again.
         return [existing_req], existing_req
 
-    def all_requirements(self):
-        # type: () -> List[InstallRequirement]
-        return (list(self.requirements.values()) +
-                list(self.unnamed_requirements))
-
     def has_requirement(self, name):
         # type: (str) -> bool
         project_name = canonicalize_name(name)

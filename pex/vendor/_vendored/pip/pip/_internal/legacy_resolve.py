@@ -343,8 +343,8 @@ class Resolver(BaseResolver):
 
         self._persistent_dependency_cache = persistent_dependency_cache
 
-    def resolve(self, requirement_set):
-        # type: (RequirementSet) -> RequirementSet
+    def resolve(self, root_reqs, check_supported_wheels):
+        # type: (List[InstallRequirement], bool) -> RequirementSet
         """Resolve what operations need to be done
 
         As a side-effect of this method, the packages (and their dependencies)
@@ -356,6 +356,12 @@ class Resolver(BaseResolver):
         dependency resolution.
         """
         with self._persistent_dependency_cache as dep_cache:
+            requirement_set = RequirementSet(
+                check_supported_wheels=check_supported_wheels
+            )
+            for req in root_reqs:
+                requirement_set.add_requirement(req)
+
             # Actually prepare the files, and collect any exceptions. Most hash
             # exceptions cannot be checked ahead of time, because
             # req.populate_link() needs to be called before we can make
@@ -365,8 +371,6 @@ class Resolver(BaseResolver):
             hash_errors = HashErrors()
 
             found_reqs = set()  # type: Set[str]
-
-            root_reqs = requirement_set.all_requirements()
 
             for req in chain(root_reqs, discovered_reqs, forced_eager_reqs):
 
@@ -402,7 +406,8 @@ class Resolver(BaseResolver):
                         else:
                             cur_discovered_reqs.append(r)
 
-                    dep_cache.add_dependency_links(req, cur_discovered_reqs)
+                    if self.quickly_parse_sub_requirements:
+                        dep_cache.add_dependency_links(req, cur_discovered_reqs)
 
                     discovered_reqs.extend(cur_discovered_reqs)
                 except HashError as exc:
@@ -696,8 +701,10 @@ class Resolver(BaseResolver):
         if req_to_install.link and not req_to_install.force_eager_download:
             parent_req = req_to_install.copy()
 
-            maybe_cached_sub_reqs = dep_cache.get(
-                RequirementConcreteUrl.from_install_req(parent_req))
+            maybe_cached_sub_reqs = None
+            if self.quickly_parse_sub_requirements:
+                maybe_cached_sub_reqs = dep_cache.get(
+                    RequirementConcreteUrl.from_install_req(parent_req))
             if maybe_cached_sub_reqs is not None:
                 logger.debug(
                     'cached sub requirements were found: {} for {}'
@@ -722,7 +729,7 @@ class Resolver(BaseResolver):
         # FIXME: perform the Requires-Python checking for shallowly-resolved
         # requirements (via self._hacky_extract_sub_reqs)!!!
         if not abstract_dist.has_been_downloaded():
-            # import pdb; pdb.set_trace()
+            assert self.quickly_parse_sub_requirements
 
             parent_req = abstract_dist.req.copy()
 

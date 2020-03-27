@@ -143,7 +143,9 @@ class DownloadCommand(RequirementCommand):
 
             self.trace_basic_info(finder)
 
-            resolver.resolve(requirement_set)
+            resolver.resolve(
+                requirement_set.requirements.values(),
+                check_supported_wheels=True)
 
             downloaded = ' '.join([
                 req.name for req in requirement_set.successfully_downloaded
