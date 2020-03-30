@@ -194,6 +194,7 @@ class BuildResult(namedtuple('BuildResult', ['request', 'atomic_dir'])):
       build_request.fingerprint,
       build_request.target.id
     )
+    os.makedirs(dist_dir)
     return cls(request=build_request, atomic_dir=AtomicDirectory(dist_dir))
 
   @property
