@@ -1,38 +1,41 @@
-# The following comment should be removed at some point in the future.
-# mypy: disallow-untyped-defs=False
-
 from __future__ import absolute_import
 
 import sys
 import textwrap
 
 from pip._internal.cli.base_command import Command
+from pip._internal.cli.status_codes import SUCCESS
 from pip._internal.utils.misc import get_prog
+from pip._internal.utils.typing import MYPY_CHECK_RUNNING
+
+if MYPY_CHECK_RUNNING:
+    from typing import Any, List
+    from optparse import Values
 
 BASE_COMPLETION = """
-# pip %(shell)s completion start%(script)s# pip %(shell)s completion end
+# pip {shell} completion start{script}# pip {shell} completion end
 """
 
 COMPLETION_SCRIPTS = {
     'bash': """
         _pip_completion()
-        {
-            COMPREPLY=( $( COMP_WORDS="${COMP_WORDS[*]}" \\
+        {{
+            COMPREPLY=( $( COMP_WORDS="${{COMP_WORDS[*]}}" \\
                            COMP_CWORD=$COMP_CWORD \\
                            PIP_AUTO_COMPLETE=1 $1 2>/dev/null ) )
-        }
-        complete -o default -F _pip_completion %(prog)s
+        }}
+        complete -o default -F _pip_completion {prog}
     """,
     'zsh': """
-        function _pip_completion {
+        function _pip_completion {{
           local words cword
           read -Ac words
           read -cn cword
           reply=( $( COMP_WORDS="$words[*]" \\
                      COMP_CWORD=$(( cword-1 )) \\
                      PIP_AUTO_COMPLETE=1 $words[1] 2>/dev/null ))
-        }
-        compctl -K _pip_completion %(prog)s
+        }}
+        compctl -K _pip_completion {prog}
     """,
     'fish': """
         function __fish_complete_pip
@@ -43,7 +46,7 @@ COMPLETION_SCRIPTS = {
             set -lx PIP_AUTO_COMPLETE 1
             string split \\  -- (eval $COMP_WORDS[1])
         end
-        complete -fa "(__fish_complete_pip)" -c %(prog)s
+        complete -fa "(__fish_complete_pip)" -c {prog}
     """,
 }
 
@@ -54,6 +57,7 @@ class CompletionCommand(Command):
     ignore_require_venv = True
 
     def __init__(self, *args, **kw):
+        # type: (*Any, **Any) -> None
         super(CompletionCommand, self).__init__(*args, **kw)
 
         cmd_opts = self.cmd_opts
@@ -80,17 +84,19 @@ class CompletionCommand(Command):
         self.parser.insert_option_group(0, cmd_opts)
 
     def run(self, options, args):
+        #  type: (Values, List[str]) -> int
         """Prints the completion code of the given shell"""
         shells = COMPLETION_SCRIPTS.keys()
         shell_options = ['--' + shell for shell in sorted(shells)]
         if options.shell in shells:
             script = textwrap.dedent(
-                COMPLETION_SCRIPTS.get(options.shell, '') % {
-                    'prog': get_prog(),
-                }
+                COMPLETION_SCRIPTS.get(options.shell, '').format(
+                    prog=get_prog())
             )
-            print(BASE_COMPLETION % {'script': script, 'shell': options.shell})
+            print(BASE_COMPLETION.format(script=script, shell=options.shell))
+            return SUCCESS
         else:
             sys.stderr.write(
-                'ERROR: You must pass %s\n' % ' or '.join(shell_options)
+                'ERROR: You must pass {}\n' .format(' or '.join(shell_options))
             )
+            return SUCCESS

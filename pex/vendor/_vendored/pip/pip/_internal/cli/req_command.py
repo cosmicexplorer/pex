@@ -7,14 +7,13 @@ PackageFinder machinery and all its vendored dependencies, etc.
 
 import logging
 import os
-import re
 from functools import partial
 
+from pip._internal.cli import cmdoptions
 from pip._internal.cli.base_command import Command
 from pip._internal.cli.command_context import CommandContextMixIn
-from pip._internal.exceptions import CommandError
+from pip._internal.exceptions import CommandError, PreviousBuildDirError
 from pip._internal.index.package_finder import PackageFinder
-from pip._internal.legacy_resolve import Resolver
 from pip._internal.models.selection_prefs import SelectionPreferences
 from pip._internal.network.download import Downloader
 from pip._internal.network.session import PipSession
@@ -22,24 +21,35 @@ from pip._internal.operations.prepare import RequirementPreparer
 from pip._internal.req.constructors import (
     install_req_from_editable,
     install_req_from_line,
+    install_req_from_parsed_requirement,
     install_req_from_req_string,
 )
 from pip._internal.req.req_file import parse_requirements
+from pip._internal.resolution.legacy.resolver import (
+    PersistentRequirementDependencyCache,
+    Resolver,
+)
 from pip._internal.self_outdated_check import (
     make_link_collector,
     pip_self_version_check,
 )
-from pip._internal.utils.misc import normalize_path
+from pip._internal.utils.temp_dir import tempdir_kinds
 from pip._internal.utils.typing import MYPY_CHECK_RUNNING
 
 if MYPY_CHECK_RUNNING:
     from optparse import Values
-    from typing import Dict, List, Optional, Tuple
+    from typing import Any, List, Optional, Tuple
+
     from pip._internal.cache import WheelCache
     from pip._internal.models.target_python import TargetPython
-    from pip._internal.req.req_set import RequirementSet
+    from pip._internal.req.req_install import InstallRequirement
     from pip._internal.req.req_tracker import RequirementTracker
-    from pip._internal.utils.temp_dir import TempDirectory
+    from pip._internal.resolution.base import BaseResolver
+    from pip._internal.utils.temp_dir import (
+        TempDirectory,
+        TempDirectoryTypeRegistry,
+    )
+
 
 logger = logging.getLogger(__name__)
 
@@ -69,37 +79,6 @@ class SessionCommandMixin(CommandContextMixIn):
         # Return None rather than an empty list
         return index_urls or None
 
-    @classmethod
-    def _get_headers(cls, options):
-        # type: (Values) -> Optional[Dict[str, str]]
-        """
-        Return a dict of extra HTTP request headers from user-provided options.
-        """
-        # Pull header inputs
-        header_inputs = getattr(options, 'headers', [])
-        if not header_inputs:
-            return None
-
-        # Refuse to set headers when multiple index URLs are set
-        index_urls = cls._get_index_urls(options)
-        if index_urls and len(index_urls) > 1:
-            logger.warning(
-                'Refusing to set -H / --header option(s) because multiple '
-                'index URLs are configured.',
-            )
-            return None
-
-        # Parse header inputs into dict
-        headers = {}
-        for header in header_inputs:
-            match = re.match(r'^(.+?):\s*(.+)$', header.lstrip())
-            if match:
-                key, val = match.groups()
-                headers[key] = val
-            else:
-                logger.critical('Could not parse header {!r}'.format(header))
-        return headers or None
-
     def get_default_session(self, options):
         # type: (Values) -> PipSession
         """Get a default-managed session."""
@@ -113,15 +92,15 @@ class SessionCommandMixin(CommandContextMixIn):
 
     def _build_session(self, options, retries=None, timeout=None):
         # type: (Values, Optional[int], Optional[int]) -> PipSession
+        assert not options.cache_dir or os.path.isabs(options.cache_dir)
         session = PipSession(
             cache=(
-                normalize_path(os.path.join(options.cache_dir, "http"))
+                os.path.join(options.cache_dir, "http")
                 if options.cache_dir else None
             ),
             retries=retries if retries is not None else options.retries,
             trusted_hosts=options.trusted_hosts,
             index_urls=self._get_index_urls(options),
-            headers=self._get_headers(options),
         )
 
         # Handle custom ca-bundles from the user
@@ -182,18 +161,61 @@ class IndexGroupCommand(Command, SessionCommandMixin):
             pip_self_version_check(session, options)
 
 
+KEEPABLE_TEMPDIR_TYPES = [
+    tempdir_kinds.BUILD_ENV,
+    tempdir_kinds.EPHEM_WHEEL_CACHE,
+    tempdir_kinds.REQ_BUILD,
+]
+
+
+def with_cleanup(func):
+    # type: (Any) -> Any
+    """Decorator for common logic related to managing temporary
+    directories.
+    """
+    def configure_tempdir_registry(registry):
+        # type: (TempDirectoryTypeRegistry) -> None
+        for t in KEEPABLE_TEMPDIR_TYPES:
+            registry.set_delete(t, False)
+
+    def wrapper(self, options, args):
+        # type: (RequirementCommand, Values, List[Any]) -> Optional[int]
+        assert self.tempdir_registry is not None
+        if options.no_clean:
+            configure_tempdir_registry(self.tempdir_registry)
+
+        try:
+            return func(self, options, args)
+        except PreviousBuildDirError:
+            # This kind of conflict can occur when the user passes an explicit
+            # build directory with a pre-existing folder. In that case we do
+            # not want to accidentally remove it.
+            configure_tempdir_registry(self.tempdir_registry)
+            raise
+
+    return wrapper
+
+
 class RequirementCommand(IndexGroupCommand):
+
+    def __init__(self, *args, **kw):
+        # type: (Any, Any) -> None
+        super(RequirementCommand, self).__init__(*args, **kw)
+
+        self.cmd_opts.add_option(cmdoptions.no_clean())
+        self.cmd_opts.add_option(cmdoptions.quickly_parse_sub_requirements())
 
     @staticmethod
     def make_requirement_preparer(
-        temp_build_dir,           # type: TempDirectory
-        options,                  # type: Values
-        req_tracker,              # type: RequirementTracker
-        session,                  # type: PipSession
-        finder,                   # type: PackageFinder
-        use_user_site,            # type: bool
-        download_dir=None,        # type: str
-        wheel_download_dir=None,  # type: str
+        temp_build_dir,                        # type: TempDirectory
+        options,                               # type: Values
+        req_tracker,                           # type: RequirementTracker
+        session,                               # type: PipSession
+        finder,                                # type: PackageFinder
+        use_user_site,                         # type: bool
+        download_dir=None,                     # type: str
+        wheel_download_dir=None,               # type: str
+        quickly_parse_sub_requirements=False,  # type: bool
     ):
         # type: (...) -> RequirementPreparer
         """
@@ -215,6 +237,7 @@ class RequirementCommand(IndexGroupCommand):
             finder=finder,
             require_hashes=options.require_hashes,
             use_user_site=use_user_site,
+            quickly_parse_sub_requirements=quickly_parse_sub_requirements,
         )
 
     @staticmethod
@@ -229,21 +252,49 @@ class RequirementCommand(IndexGroupCommand):
         force_reinstall=False,               # type: bool
         upgrade_strategy="to-satisfy-only",  # type: str
         use_pep517=None,                     # type: Optional[bool]
-        py_version_info=None            # type: Optional[Tuple[int, ...]]
+        py_version_info=None,                # type: Optional[Tuple[int, ...]]
+        quickly_parse_sub_requirements=False,  # type: bool
+        session=None                         # type: Optional[PipSession]
     ):
-        # type: (...) -> Resolver
+        # type: (...) -> BaseResolver
         """
         Create a Resolver instance for the given parameters.
         """
         make_install_req = partial(
             install_req_from_req_string,
             isolated=options.isolated_mode,
-            wheel_cache=wheel_cache,
             use_pep517=use_pep517,
         )
-        return Resolver(
+
+        persistent_cache_file = os.path.join(
+            options.cache_dir,
+            'requirement-link-dependency-cache-v1.json')
+        persistent_dependency_cache = PersistentRequirementDependencyCache(
+            persistent_cache_file)
+
+        # The long import name and duplicated invocation is needed to convince
+        # Mypy into correctly typechecking. Otherwise it would complain the
+        # "Resolver" class being redefined.
+        if 'resolver' in options.unstable_features:
+            import pip._internal.resolution.resolvelib.resolver
+            return pip._internal.resolution.resolvelib.resolver.Resolver(
+                preparer=preparer,
+                finder=finder,
+                wheel_cache=wheel_cache,
+                make_install_req=make_install_req,
+                use_user_site=use_user_site,
+                ignore_dependencies=options.ignore_dependencies,
+                ignore_installed=ignore_installed,
+                ignore_requires_python=ignore_requires_python,
+                force_reinstall=force_reinstall,
+                upgrade_strategy=upgrade_strategy,
+                py_version_info=py_version_info,
+            )
+        import pip._internal.resolution.legacy.resolver
+        return pip._internal.resolution.legacy.resolver.Resolver(
             preparer=preparer,
             finder=finder,
+            wheel_cache=wheel_cache,
             make_install_req=make_install_req,
             use_user_site=use_user_site,
             ignore_dependencies=options.ignore_dependencies,
@@ -252,63 +303,66 @@ class RequirementCommand(IndexGroupCommand):
             force_reinstall=force_reinstall,
             upgrade_strategy=upgrade_strategy,
             py_version_info=py_version_info,
+            quickly_parse_sub_requirements=quickly_parse_sub_requirements,
+            session=session,
+            persistent_dependency_cache=persistent_dependency_cache,
         )
 
-    def populate_requirement_set(
+    def get_requirements(
         self,
-        requirement_set,  # type: RequirementSet
         args,             # type: List[str]
         options,          # type: Values
         finder,           # type: PackageFinder
         session,          # type: PipSession
-        wheel_cache,      # type: Optional[WheelCache]
     ):
-        # type: (...) -> None
+        # type: (...) -> List[InstallRequirement]
         """
-        Marshal cmd line args into a requirement set.
+        Parse command-line arguments into the corresponding requirements.
         """
+        requirements = []  # type: List[InstallRequirement]
         for filename in options.constraints:
-            for req_to_add in parse_requirements(
+            for parsed_req in parse_requirements(
                     filename,
                     constraint=True, finder=finder, options=options,
-                    session=session, wheel_cache=wheel_cache):
+                    session=session):
+                req_to_add = install_req_from_parsed_requirement(
+                    parsed_req,
+                    isolated=options.isolated_mode,
+                )
                 req_to_add.is_direct = True
-                requirement_set.add_requirement(req_to_add)
+                requirements.append(req_to_add)
 
         for req in args:
             req_to_add = install_req_from_line(
                 req, None, isolated=options.isolated_mode,
                 use_pep517=options.use_pep517,
-                wheel_cache=wheel_cache
             )
             req_to_add.is_direct = True
-            requirement_set.add_requirement(req_to_add)
+            requirements.append(req_to_add)
 
         for req in options.editables:
             req_to_add = install_req_from_editable(
                 req,
                 isolated=options.isolated_mode,
                 use_pep517=options.use_pep517,
-                wheel_cache=wheel_cache
             )
             req_to_add.is_direct = True
-            requirement_set.add_requirement(req_to_add)
+            requirements.append(req_to_add)
 
         # NOTE: options.require_hashes may be set if --require-hashes is True
         for filename in options.requirements:
-            for req_to_add in parse_requirements(
+            for parsed_req in parse_requirements(
                     filename,
-                    finder=finder, options=options, session=session,
-                    wheel_cache=wheel_cache,
-                    use_pep517=options.use_pep517):
+                    finder=finder, options=options, session=session):
+                req_to_add = install_req_from_parsed_requirement(
+                    parsed_req,
+                    isolated=options.isolated_mode,
+                    use_pep517=options.use_pep517
+                )
                 req_to_add.is_direct = True
-                requirement_set.add_requirement(req_to_add)
+                requirements.append(req_to_add)
 
         # If any requirement has hash options, enable hash checking.
-        requirements = (
-            requirement_set.unnamed_requirements +
-            list(requirement_set.requirements.values())
-        )
         if any(req.has_hash_options for req in requirements):
             options.require_hashes = True
 
@@ -316,13 +370,15 @@ class RequirementCommand(IndexGroupCommand):
             opts = {'name': self.name}
             if options.find_links:
                 raise CommandError(
-                    'You must give at least one requirement to %(name)s '
-                    '(maybe you meant "pip %(name)s %(links)s"?)' %
-                    dict(opts, links=' '.join(options.find_links)))
+                    'You must give at least one requirement to {name} '
+                    '(maybe you meant "pip {name} {links}"?)'.format(
+                        **dict(opts, links=' '.join(options.find_links))))
             else:
                 raise CommandError(
-                    'You must give at least one requirement to %(name)s '
-                    '(see "pip help %(name)s")' % opts)
+                    'You must give at least one requirement to {name} '
+                    '(see "pip help {name}")'.format(**opts))
+
+        return requirements
 
     @staticmethod
     def trace_basic_info(finder):
@@ -363,4 +419,6 @@ class RequirementCommand(IndexGroupCommand):
             link_collector=link_collector,
             selection_prefs=selection_prefs,
             target_python=target_python,
+            quickly_parse_sub_requirements=(
+                options.quickly_parse_sub_requirements),
         )

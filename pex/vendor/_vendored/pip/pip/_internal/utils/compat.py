@@ -64,7 +64,7 @@ if PY2:
         raw_bytes = (err.object[i] for i in range(err.start, err.end))
         # Python 2 gave us characters - convert to numeric bytes
         raw_bytes = (ord(b) for b in raw_bytes)
-        return u"".join(u"\\x%x" % c for c in raw_bytes), err.end
+        return u"".join(map(u"\\x{:x}".format, raw_bytes)), err.end
     codecs.register_error(
         "backslashreplace_decode",
         backslashreplace_decode_fn,
@@ -184,7 +184,8 @@ def get_path_uid(path):
         else:
             # raise OSError for parity with os.O_NOFOLLOW above
             raise OSError(
-                "%s is a symlink; Will not return uid for symlinks" % path
+                "{} is a symlink; Will not return uid for symlinks".format(
+                    path)
             )
     return file_uid
 
@@ -257,12 +258,13 @@ else:
             return cr
         cr = ioctl_GWINSZ(0) or ioctl_GWINSZ(1) or ioctl_GWINSZ(2)
         if not cr:
-            try:
-                fd = os.open(os.ctermid(), os.O_RDONLY)
-                cr = ioctl_GWINSZ(fd)
-                os.close(fd)
-            except Exception:
-                pass
+            if sys.platform != "win32":
+                try:
+                    fd = os.open(os.ctermid(), os.O_RDONLY)
+                    cr = ioctl_GWINSZ(fd)
+                    os.close(fd)
+                except Exception:
+                    pass
         if not cr:
             cr = (os.environ.get('LINES', 25), os.environ.get('COLUMNS', 80))
         return int(cr[1]), int(cr[0])

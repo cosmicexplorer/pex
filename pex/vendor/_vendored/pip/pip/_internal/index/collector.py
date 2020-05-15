@@ -3,10 +3,12 @@ The main purpose of this module is to expose LinkCollector.collect_links().
 """
 
 import cgi
+import functools
 import itertools
 import logging
 import mimetypes
 import os
+import re
 from collections import OrderedDict
 
 from pip._vendor import html5lib, requests
@@ -17,15 +19,15 @@ from pip._vendor.six.moves.urllib import request as urllib_request
 
 from pip._internal.models.link import Link
 from pip._internal.utils.filetypes import ARCHIVE_EXTENSIONS
-from pip._internal.utils.misc import redact_auth_from_url
+from pip._internal.utils.misc import pairwise, redact_auth_from_url
 from pip._internal.utils.typing import MYPY_CHECK_RUNNING
 from pip._internal.utils.urls import path_to_url, url_to_path
 from pip._internal.vcs import is_url, vcs
 
 if MYPY_CHECK_RUNNING:
     from typing import (
-        Any, Callable, Dict, Iterable, List, MutableMapping, Optional,
-        Sequence, Tuple, Union,
+        Callable, Iterable, List, MutableMapping, Optional,
+        Protocol, Sequence, Tuple, TypeVar, Union,
     )
     import xml.etree.ElementTree
 
@@ -37,34 +39,29 @@ if MYPY_CHECK_RUNNING:
     HTMLElement = xml.etree.ElementTree.Element
     ResponseHeaders = MutableMapping[str, str]
 
+    # Used in the @lru_cache polyfill.
+    F = TypeVar('F')
+
+    class LruCache(Protocol):
+        def __call__(self, maxsize=None):
+            # type: (Optional[int]) -> Callable[[F], F]
+            raise NotImplementedError
+
 
 logger = logging.getLogger(__name__)
 
 
-def lru_cache(
-        *args,                  # type: Any
-        **kwargs                # type: Any
-):
-    # type: (...) -> Any
-    cache = {}                  # type: Dict[Any, Any]
+# Fallback to noop_lru_cache in Python 2
+# TODO: this can be removed when python 2 support is dropped!
+def noop_lru_cache(maxsize=None):
+    # type: (Optional[int]) -> Callable[[F], F]
+    def _wrapper(f):
+        # type: (F) -> F
+        return f
+    return _wrapper
 
-    def wrapper(fn):
-        # type: (Any) -> Any
 
-        def wrapped(
-                *args,          # type: Any
-                **kwargs        # type: Any
-        ):
-            # type: (...) -> Any
-            cache_key = tuple(args) + tuple(kwargs.items())
-            value = cache.get(cache_key, None)
-            if value is not None:
-                return value
-            value = fn(*args, **kwargs)
-            cache[cache_key] = value
-            return value
-        return wrapped
-    return wrapper
+_lru_cache = getattr(functools, "lru_cache", noop_lru_cache)  # type: LruCache
 
 
 def _match_vcs_scheme(url):
@@ -166,9 +163,7 @@ def _get_html_response(url, session):
             # trip for the conditional GET now instead of only
             # once per 10 minutes.
             # For more information, please see pypa/pip#5670.
-            # However if we want to override Cache-Control, e.g. via CLI,
-            # we can still do so.
-            "Cache-Control": session.headers.get('Cache-Control', 'max-age=0'),
+            "Cache-Control": "max-age=0",
         },
     )
     resp.raise_for_status()
@@ -214,29 +209,69 @@ def _determine_base_url(document, page_url):
     return page_url
 
 
+def _clean_url_path_part(part):
+    # type: (str) -> str
+    """
+    Clean a "part" of a URL path (i.e. after splitting on "@" characters).
+    """
+    # We unquote prior to quoting to make sure nothing is double quoted.
+    return urllib_parse.quote(urllib_parse.unquote(part))
+
+
+def _clean_file_url_path(part):
+    # type: (str) -> str
+    """
+    Clean the first part of a URL path that corresponds to a local
+    filesystem path (i.e. the first part after splitting on "@" characters).
+    """
+    # We unquote prior to quoting to make sure nothing is double quoted.
+    # Also, on Windows the path part might contain a drive letter which
+    # should not be quoted. On Linux where drive letters do not
+    # exist, the colon should be quoted. We rely on urllib.request
+    # to do the right thing here.
+    return urllib_request.pathname2url(urllib_request.url2pathname(part))
+
+
+# percent-encoded:                   /
+_reserved_chars_re = re.compile('(@|%2F)', re.IGNORECASE)
+
+
+def _clean_url_path(path, is_local_path):
+    # type: (str, bool) -> str
+    """
+    Clean the path portion of a URL.
+    """
+    if is_local_path:
+        clean_func = _clean_file_url_path
+    else:
+        clean_func = _clean_url_path_part
+
+    # Split on the reserved characters prior to cleaning so that
+    # revision strings in VCS URLs are properly preserved.
+    parts = _reserved_chars_re.split(path)
+
+    cleaned_parts = []
+    for to_clean, reserved in pairwise(itertools.chain(parts, [''])):
+        cleaned_parts.append(clean_func(to_clean))
+        # Normalize %xx escapes (e.g. %2f -> %2F)
+        cleaned_parts.append(reserved.upper())
+
+    return ''.join(cleaned_parts)
+
+
 def _clean_link(url):
     # type: (str) -> str
-    """Makes sure a link is fully encoded.  That is, if a ' ' shows up in
-    the link, it will be rewritten to %20 (while not over-quoting
-    % or other characters)."""
+    """
+    Make sure a link is fully quoted.
+    For example, if ' ' occurs in the URL, it will be replaced with "%20",
+    and without double-quoting other characters.
+    """
     # Split the URL into parts according to the general structure
-    # `scheme://netloc/path;parameters?query#fragment`. Note that the
-    # `netloc` can be empty and the URI will then refer to a local
-    # filesystem path.
+    # `scheme://netloc/path;parameters?query#fragment`.
     result = urllib_parse.urlparse(url)
-    # In both cases below we unquote prior to quoting to make sure
-    # nothing is double quoted.
-    if result.netloc == "":
-        # On Windows the path part might contain a drive letter which
-        # should not be quoted. On Linux where drive letters do not
-        # exist, the colon should be quoted. We rely on urllib.request
-        # to do the right thing here.
-        path = urllib_request.pathname2url(
-            urllib_request.url2pathname(result.path))
-    else:
-        # In addition to the `/` character we protect `@` so that
-        # revision strings in VCS URLs are properly parsed.
-        path = urllib_parse.quote(urllib_parse.unquote(result.path), safe="/@")
+    # If the netloc is empty, then the URL refers to a local filesystem path.
+    is_local_path = not result.netloc
+    path = _clean_url_path(result.path, is_local_path=is_local_path)
     return urllib_parse.urlunparse(result._replace(path=path))
 
 
@@ -275,30 +310,40 @@ def _create_link_from_element(
 class CacheablePageContent(object):
     def __init__(self, page):
         # type: (HTMLPage) -> None
+        assert page.cache_link_parsing
         self.page = page
 
     def __eq__(self, other):
         # type: (object) -> bool
         return (isinstance(other, type(self)) and
-                self.page.content == other.page.content and
-                self.page.encoding == other.page.encoding)
+                self.page.url == other.page.url)
 
     def __hash__(self):
         # type: () -> int
-        return hash((self.page.content, self.page.encoding))
+        return hash(self.page.url)
 
 
-def with_cached_html_pages(fn):
-    # type: (Any) -> Any
+def with_cached_html_pages(
+    fn,    # type: Callable[[HTMLPage], Iterable[Link]]
+):
+    # type: (...) -> Callable[[HTMLPage], List[Link]]
+    """
+    Given a function that parses an Iterable[Link] from an HTMLPage, cache the
+    function's result (keyed by CacheablePageContent), unless the HTMLPage
+    `page` has `page.cache_link_parsing == False`.
+    """
 
-    @lru_cache(maxsize=None)
+    @_lru_cache(maxsize=None)
     def wrapper(cacheable_page):
-        # type: (CacheablePageContent) -> List[Any]
+        # type: (CacheablePageContent) -> List[Link]
         return list(fn(cacheable_page.page))
 
+    @functools.wraps(fn)
     def wrapper_wrapper(page):
-        # type: (HTMLPage) -> List[Any]
-        return wrapper(CacheablePageContent(page))
+        # type: (HTMLPage) -> List[Link]
+        if page.cache_link_parsing:
+            return wrapper(CacheablePageContent(page))
+        return list(fn(page))
 
     return wrapper_wrapper
 
@@ -333,18 +378,23 @@ class HTMLPage(object):
 
     def __init__(
         self,
-        content,   # type: bytes
-        encoding,  # type: Optional[str]
-        url,       # type: str
+        content,                  # type: bytes
+        encoding,                 # type: Optional[str]
+        url,                      # type: str
+        cache_link_parsing=True,  # type: bool
     ):
         # type: (...) -> None
         """
         :param encoding: the encoding to decode the given content.
         :param url: the URL from which the HTML was downloaded.
+        :param cache_link_parsing: whether links parsed from this page's url
+                                   should be cached. PyPI index urls should
+                                   have this set to False, for example.
         """
         self.content = content
         self.encoding = encoding
         self.url = url
+        self.cache_link_parsing = cache_link_parsing
 
     def __str__(self):
         # type: () -> str
@@ -362,24 +412,16 @@ def _handle_get_page_fail(
     meth("Could not fetch URL %s: %s - skipping", link, reason)
 
 
-def _make_html_page(response):
-    # type: (Response) -> HTMLPage
+def _make_html_page(response, cache_link_parsing=True):
+    # type: (Response, bool) -> HTMLPage
     encoding = _get_encoding_from_headers(response.headers)
-    return HTMLPage(response.content, encoding=encoding, url=response.url)
+    return HTMLPage(
+        response.content,
+        encoding=encoding,
+        url=response.url,
+        cache_link_parsing=cache_link_parsing)
 
 
-def with_cached_link_fetch(fn):
-    # type: (Any) -> Any
-
-    @lru_cache(maxsize=None)
-    def wrapper(link, session=None):
-        # type: (Link, Optional[PipSession]) -> Optional[HTMLPage]
-        return fn(link, session=session)
-
-    return wrapper
-
-
-@with_cached_link_fetch
 def _get_html_page(link, session=None):
     # type: (Link, Optional[PipSession]) -> Optional[HTMLPage]
     if session is None:
@@ -426,11 +468,12 @@ def _get_html_page(link, session=None):
         reason += str(exc)
         _handle_get_page_fail(link, reason, meth=logger.info)
     except requests.ConnectionError as exc:
-        _handle_get_page_fail(link, "connection error: %s" % exc)
+        _handle_get_page_fail(link, "connection error: {}".format(exc))
     except requests.Timeout:
         _handle_get_page_fail(link, "timed out")
     else:
-        return _make_html_page(resp)
+        return _make_html_page(resp,
+                               cache_link_parsing=link.cache_link_parsing)
     return None
 
 
@@ -593,7 +636,9 @@ class LinkCollector(object):
         # We want to filter out anything that does not have a secure origin.
         url_locations = [
             link for link in itertools.chain(
-                (Link(url) for url in index_url_loc),
+                # Mark PyPI indices as "cache_link_parsing == False" -- this
+                # will avoid caching the result of parsing the page for links.
+                (Link(url, cache_link_parsing=False) for url in index_url_loc),
                 (Link(url) for url in fl_url_loc),
             )
             if self.session.is_secure_origin(link)
