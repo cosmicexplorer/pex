@@ -7,6 +7,7 @@ from __future__ import absolute_import
 
 import logging
 import re
+import shlex
 
 from pip._vendor.packaging import specifiers
 from pip._vendor.packaging.utils import canonicalize_name
@@ -37,11 +38,13 @@ if MYPY_CHECK_RUNNING:
     from typing import (
         FrozenSet, Iterable, List, Optional, Set, Text, Tuple, Union,
     )
+
+    from pip._vendor.packaging.tags import Tag
     from pip._vendor.packaging.version import _BaseVersion
+
     from pip._internal.index.collector import LinkCollector
     from pip._internal.models.search_scope import SearchScope
     from pip._internal.req import InstallRequirement
-    from pip._internal.pep425tags import Pep425Tag
     from pip._internal.utils.hashes import Hashes
 
     BuildTag = Union[Tuple[()], Tuple[int, str]]
@@ -146,10 +149,11 @@ class LinkEvaluator(object):
         self._ignore_requires_python = ignore_requires_python
         self._formats = formats
         self._target_python = target_python
+        self.t_py_regex = re.compile(self._target_python.as_regex())
 
         self.project_name = project_name
 
-    def evaluate_link(self, link):
+    def evaluate_link(self, link, ignore_tags=False):
         # type: (Link) -> Tuple[bool, Optional[Text]]
         """
         Determine whether a link is a candidate for installation.
@@ -175,9 +179,10 @@ class LinkEvaluator(object):
             if not ext:
                 return (False, 'not a file')
             if ext not in SUPPORTED_EXTENSIONS:
-                return (False, 'unsupported archive format: %s' % ext)
+                return (False, 'unsupported archive format: {}'.format(ext))
             if "binary" not in self._formats and ext == WHEEL_EXTENSION:
-                reason = 'No binaries permitted for %s' % self.project_name
+                reason = 'No binaries permitted for {}'.format(
+                    self.project_name)
                 return (False, reason)
             if "macosx10" in link.path and ext == '.zip':
                 return (False, 'macosx10 one')
@@ -187,11 +192,12 @@ class LinkEvaluator(object):
                 except InvalidWheelFilename:
                     return (False, 'invalid wheel filename')
                 if canonicalize_name(wheel.name) != self._canonical_name:
-                    reason = 'wrong project name (not %s)' % self.project_name
+                    reason = 'wrong project name (not {})'.format(
+                        self.project_name)
                     return (False, reason)
 
                 supported_tags = self._target_python.get_tags()
-                if not wheel.supported(supported_tags):
+                if not wheel.supported(supported_tags) and not ignore_tags:
                     # Include the wheel's tags in the reason string to
                     # simplify troubleshooting compatibility issues.
                     file_tags = wheel.get_formatted_file_tags()
@@ -206,16 +212,16 @@ class LinkEvaluator(object):
 
         # This should be up by the self.ok_binary check, but see issue 2700.
         if "source" not in self._formats and ext != WHEEL_EXTENSION:
-            return (False, 'No sources permitted for %s' % self.project_name)
+            reason = 'No sources permitted for {}'.format(self.project_name)
+            return (False, reason)
 
         if not version:
             version = _extract_version_from_fragment(
                 egg_info, self._canonical_name,
             )
         if not version:
-            return (
-                False, 'Missing project version for %s' % self.project_name,
-            )
+            reason = 'Missing project version for {}'.format(self.project_name)
+            return (False, reason)
 
         match = self._py_version_re.search(version)
         if match:
@@ -394,6 +400,7 @@ class CandidateEvaluator(object):
         allow_all_prereleases=False,  # type: bool
         specifier=None,       # type: Optional[specifiers.BaseSpecifier]
         hashes=None,          # type: Optional[Hashes]
+        quickly_parse_sub_requirements=False,  # type: bool
     ):
         # type: (...) -> CandidateEvaluator
         """Create a CandidateEvaluator object.
@@ -420,16 +427,18 @@ class CandidateEvaluator(object):
             prefer_binary=prefer_binary,
             allow_all_prereleases=allow_all_prereleases,
             hashes=hashes,
+            quickly_parse_sub_requirements=quickly_parse_sub_requirements,
         )
 
     def __init__(
         self,
         project_name,         # type: str
-        supported_tags,       # type: List[Pep425Tag]
+        supported_tags,       # type: List[Tag]
         specifier,            # type: specifiers.BaseSpecifier
         prefer_binary=False,  # type: bool
         allow_all_prereleases=False,  # type: bool
         hashes=None,                  # type: Optional[Hashes]
+        quickly_parse_sub_requirements=False,  # type: bool
     ):
         # type: (...) -> None
         """
@@ -442,6 +451,7 @@ class CandidateEvaluator(object):
         self._project_name = project_name
         self._specifier = specifier
         self._supported_tags = supported_tags
+        self.quickly_parse_sub_requirements = quickly_parse_sub_requirements
 
     def get_applicable_candidates(
         self,
@@ -520,14 +530,20 @@ class CandidateEvaluator(object):
         if link.is_wheel:
             # can raise InvalidWheelFilename
             wheel = Wheel(link.filename)
-            if not wheel.supported(valid_tags):
-                raise UnsupportedWheel(
-                    "%s is not a supported wheel for this platform. It "
-                    "can't be sorted." % wheel.filename
-                )
+            # FIXME: add back this check for non-`resolve` tasks!!
+            # if not wheel.supported(valid_tags):
+            #     raise UnsupportedWheel(
+            #         "{} is not a supported wheel for this platform. It "
+            #         "can't be sorted.".format(wheel.filename)
+            #     )
             if self._prefer_binary:
                 binary_preference = 1
-            pri = -(wheel.support_index_min(valid_tags))
+
+            try:
+                pri = -(wheel.support_index_min(valid_tags))
+            except ValueError:
+                pri = 0
+
             if wheel.build_tag is not None:
                 match = re.match(r'^(\d+)(.*)$', wheel.build_tag)
                 build_tag_groups = match.groups()
@@ -553,22 +569,17 @@ class CandidateEvaluator(object):
         if not candidates:
             return None
 
+        # Prefer wheel files to other candidates if we have
+        # --quickly-parse-sub-requirements turned on.
+        if self.quickly_parse_sub_requirements:
+            maybe_zip_candidates = [
+                c for c in candidates
+                if c.link.is_wheel
+            ]
+            if maybe_zip_candidates:
+                candidates = maybe_zip_candidates
+
         best_candidate = max(candidates, key=self._sort_key)
-
-        # Log a warning per PEP 592 if necessary before returning.
-        link = best_candidate.link
-        if link.is_yanked:
-            reason = link.yanked_reason or '<none given>'
-            msg = (
-                # Mark this as a unicode string to prevent
-                # "UnicodeEncodeError: 'ascii' codec can't encode character"
-                # in Python 2 when the reason contains non-ascii characters.
-                u'The candidate selected for download or install is a '
-                'yanked version: {candidate}\n'
-                'Reason for being yanked: {reason}'
-            ).format(candidate=best_candidate, reason=reason)
-            logger.warning(msg)
-
         return best_candidate
 
     def compute_best_candidate(
@@ -605,6 +616,8 @@ class PackageFinder(object):
         format_control=None,  # type: Optional[FormatControl]
         candidate_prefs=None,         # type: CandidatePreferences
         ignore_requires_python=None,  # type: Optional[bool]
+        quickly_parse_sub_requirements=False,   # type: bool
+        external_package_link_processor=False,  # type: bool
     ):
         # type: (...) -> None
         """
@@ -633,6 +646,9 @@ class PackageFinder(object):
         # These are boring links that have already been logged somehow.
         self._logged_links = set()  # type: Set[Link]
 
+        self.quickly_parse_sub_requirements = quickly_parse_sub_requirements
+        self._external_package_link_processor = external_package_link_processor
+
     # Don't include an allow_yanked default value to make sure each call
     # site considers whether yanked releases are allowed. This also causes
     # that decision to be made explicit in the calling code, which helps
@@ -643,6 +659,8 @@ class PackageFinder(object):
         link_collector,      # type: LinkCollector
         selection_prefs,     # type: SelectionPreferences
         target_python=None,  # type: Optional[TargetPython]
+        quickly_parse_sub_requirements=False,   # type: bool
+        external_package_link_processor=False,  # type: bool
     ):
         # type: (...) -> PackageFinder
         """Create a PackageFinder.
@@ -668,6 +686,8 @@ class PackageFinder(object):
             allow_yanked=selection_prefs.allow_yanked,
             format_control=selection_prefs.format_control,
             ignore_requires_python=selection_prefs.ignore_requires_python,
+            quickly_parse_sub_requirements=quickly_parse_sub_requirements,
+            external_package_link_processor=external_package_link_processor,
         )
 
     @property
@@ -753,6 +773,27 @@ class PackageFinder(object):
         If the link is a candidate for install, convert it to an
         InstallationCandidate and return it. Otherwise, return None.
         """
+        if self._external_package_link_processor:
+            # This addresses the output "Skipping link: none of the wheel's
+            # tags match: cp38-cp38-manylinux2010_x86_64" when trying to
+            # shallow `pip resolve tensorflow==1.14.0`! Our previous method of
+            # scanning the page probably works for osx links, but not linux
+            # ones!!
+            egg_info, ext = link.splitext()
+            if ext == WHEEL_EXTENSION:
+                wheel = Wheel(link.filename)
+                file_tags = wheel.get_formatted_file_tags()
+                for tag in file_tags:
+                    if link_evaluator.t_py_regex.match(tag):
+                        return InstallationCandidate(
+                            name=link_evaluator.project_name,
+                            link=link,
+                            version=str(wheel.version),
+                        )
+                else:
+                    self._log_skipped_link(link, reason=file_tags)
+                    return None
+
         is_candidate, result = link_evaluator.evaluate_link(link)
         if not is_candidate:
             if result:
@@ -782,14 +823,32 @@ class PackageFinder(object):
 
     def process_project_url(self, project_url, link_evaluator):
         # type: (Link, LinkEvaluator) -> List[InstallationCandidate]
-        logger.debug(
-            'Fetching project page and analyzing links: %s', project_url,
-        )
-        html_page = self._link_collector.fetch_page(project_url)
-        if html_page is None:
-            return []
+        if self._external_package_link_processor:
+            logger.debug(
+                'Executing a subprocess to fetch and analyze links: %s', project_url,
+            )
+            import subprocess
+            raw_links = (subprocess
+                         .check_output(
+                             'curl -sSL --fail {url} | pup {arg}'.format(
+                                 url="'{}'".format(project_url.url),
+                                 arg="'{}'".format('a attr{href}'),
+                             ),
+                             shell=True)
+                         .decode('utf-8')
+                         .splitlines())
+            page_links = [
+                Link(url) for url in raw_links
+            ]
+        else:
+            logger.debug(
+                'Fetching project page and analyzing links: %s', project_url,
+            )
+            html_page = self._link_collector.fetch_page(project_url)
+            if html_page is None:
+                return []
 
-        page_links = list(parse_links(html_page))
+            page_links = list(parse_links(html_page))
 
         with indent_log():
             package_links = self.evaluate_links(
@@ -859,6 +918,7 @@ class PackageFinder(object):
             allow_all_prereleases=candidate_prefs.allow_all_prereleases,
             specifier=specifier,
             hashes=hashes,
+            quickly_parse_sub_requirements=self.quickly_parse_sub_requirements,
         )
 
     def find_best_candidate(
@@ -885,11 +945,11 @@ class PackageFinder(object):
         return candidate_evaluator.compute_best_candidate(candidates)
 
     def find_requirement(self, req, upgrade):
-        # type: (InstallRequirement, bool) -> Optional[Link]
+        # type: (InstallRequirement, bool) -> Optional[InstallationCandidate]
         """Try to find a Link matching req
 
         Expects req, an InstallRequirement and upgrade, a boolean
-        Returns a Link if found,
+        Returns a InstallationCandidate if found,
         Raises DistributionNotFound or BestVersionAlreadyInstalled otherwise
         """
         hashes = req.hashes(trust_internet=False)
@@ -922,7 +982,8 @@ class PackageFinder(object):
             )
 
             raise DistributionNotFound(
-                'No matching distribution found for %s' % req
+                'No matching distribution found for {}'.format(
+                    req)
             )
 
         best_installed = False
@@ -962,7 +1023,7 @@ class PackageFinder(object):
             best_candidate.version,
             _format_versions(best_candidate_result.iter_applicable()),
         )
-        return best_candidate.link
+        return best_candidate
 
 
 def _find_name_version_sep(fragment, canonical_name):

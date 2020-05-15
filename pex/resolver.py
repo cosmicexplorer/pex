@@ -7,6 +7,7 @@ from __future__ import absolute_import
 import functools
 import json
 import os
+import re
 import subprocess
 import zipfile
 from collections import OrderedDict, defaultdict, namedtuple
@@ -34,6 +35,10 @@ class Untranslateable(Exception):
 
 class Unsatisfiable(Exception):
   pass
+
+
+class UrlResolvedDistribution(namedtuple('ResolvedDistribution', ['requirement', 'url'])):
+  """A line of output from `pip resolve`."""
 
 
 class InstalledDistribution(namedtuple('InstalledDistribution',
@@ -187,21 +192,67 @@ class DownloadRequest(namedtuple('DownloadRequest', [
             yield BuildRequest.create(target=target, source_path=local_project)
 
   def download_distributions(self, dest=None, max_parallel_jobs=None):
+    return self._execute_parallel_pip_requirement_command(dest=dest,
+                                                          max_parallel_jobs=max_parallel_jobs,
+                                                          spawn_func=self._spawn_download)
+
+  def url_resolve_distributions(self, dest=None, max_parallel_jobs=None):
+    result = self._execute_parallel_pip_requirement_command(dest=dest,
+                                                            max_parallel_jobs=max_parallel_jobs,
+                                                            spawn_func=self._spawn_url_resolve)
+    assert ((len(result) >= 1) and isinstance(result[0], list)), f'the result of a url resolve must be a list of length 1 containing another list -- was: {result}'
+    return result
+
+  def _execute_parallel_pip_requirement_command(self, dest, max_parallel_jobs, spawn_func):
     if not self.requirements and not self.requirement_files:
       # Nothing to resolve.
       return None
 
     dest = dest or safe_mkdtemp()
-    spawn_download = functools.partial(self._spawn_download, dest)
+    spawn_command = functools.partial(spawn_func, dest)
     with TRACER.timed('Resolving for:\n  {}'.format('\n  '.join(map(str, self.targets)))):
       return list(
         execute_parallel(
           inputs=self.targets,
-          spawn_func=spawn_download,
+          spawn_func=spawn_command,
           raise_type=Unsatisfiable,
           max_jobs=max_parallel_jobs
         )
       )
+
+  def _spawn_url_resolve(self, resolved_dists_dir, target):
+    download_dir = os.path.join(resolved_dists_dir, target.id)
+    download_job = get_pip().spawn_url_resolve_distributions(
+      download_dir=download_dir,
+      requirements=self.requirements,
+      requirement_files=self.requirement_files,
+      constraint_files=self.constraint_files,
+      allow_prereleases=self.allow_prereleases,
+      transitive=self.transitive,
+      target=target,
+      indexes=self.indexes,
+      find_links=self.find_links,
+      network_configuration=self.network_configuration,
+      cache=self.cache,
+      build=self.build,
+      manylinux=self.manylinux,
+      use_wheel=self.use_wheel
+    )
+
+    def result_func(stdout_bytes):
+      stdout_lines = stdout_bytes.decode().splitlines()
+      assert stdout_lines[0] == 'Resolve output:', f'first stdout line was: {stdout_lines[0]}'
+
+      results = []
+      for line in stdout_lines[1:]:
+        match = re.match(r'^([^ ]+) \(([^\)]+)\)$', line)
+        assert match, f'line {line} did not match!'
+        requirement, url = tuple(match.groups())
+        results.append(UrlResolvedDistribution(requirement=requirement, url=url))
+
+      return results
+
+    return SpawnedJob.stdout(job=download_job, result_func=result_func)
 
   def _spawn_download(self, resolved_dists_dir, target):
     download_dir = os.path.join(resolved_dists_dir, target.id)
@@ -556,7 +607,6 @@ class BuildAndInstallRequest(object):
           to_install.extend(build_result.finalize_build())
 
     # 2. Install wheels in individual chroots.
-
     # Dedup by wheel name; e.g.: only install universal wheels once even though they'll get
     # downloaded / built for each interpreter or platform.
     install_requests_by_wheel_file = OrderedDict()
@@ -886,6 +936,68 @@ def resolve_multi(requirements=None,
   )
 
 
+def _url_resolve_internal(requirements=None,
+                          requirement_files=None,
+                          constraint_files=None,
+                          allow_prereleases=False,
+                          transitive=True,
+                          interpreters=None,
+                          platforms=None,
+                          indexes=None,
+                          find_links=None,
+                          network_configuration=None,
+                          cache=None,
+                          build=True,
+                          use_wheel=True,
+                          manylinux=None,
+                          dest=None,
+                          max_parallel_jobs=None):
+
+  parsed_platforms = [parsed_platform(platform) for platform in platforms] if platforms else []
+
+  def iter_targets():
+    if not interpreters and not parsed_platforms:
+      # No specified targets, so just build for the current interpreter (on the current platform).
+      yield DistributionTarget.current()
+      return
+
+    if interpreters:
+      for interpreter in interpreters:
+        # Build for the specified local interpreters (on the current platform).
+        yield DistributionTarget.for_interpreter(interpreter)
+
+    if parsed_platforms:
+      for platform in parsed_platforms:
+        if platform is not None or not interpreters:
+          # 1. Build for specific platforms.
+          # 2. Build for the current platform (None) only if not done already (ie: no intepreters
+          #    were specified).
+          yield DistributionTarget.for_platform(platform)
+
+  download_request = DownloadRequest(
+    targets=list(iter_targets()),
+    requirements=requirements,
+    requirement_files=requirement_files,
+    constraint_files=constraint_files,
+    allow_prereleases=allow_prereleases,
+    transitive=transitive,
+    indexes=indexes,
+    find_links=find_links,
+    network_configuration=network_configuration,
+    cache=cache,
+    build=build,
+    use_wheel=use_wheel,
+    manylinux=manylinux,
+  )
+
+  dest = dest or safe_mkdtemp()
+  download_results = download_request.url_resolve_distributions(
+    dest=dest,
+    max_parallel_jobs=max_parallel_jobs
+  )
+  return download_results
+
+
 def _download_internal(requirements=None,
                        requirement_files=None,
                        constraint_files=None,
@@ -960,6 +1072,88 @@ class LocalDistribution(namedtuple('LocalDistribution', ['target', 'path', 'fing
   @property
   def is_wheel(self):
     return self.path.endswith('.whl') and zipfile.is_zipfile(self.path)
+
+
+def url_resolve(requirements=None,
+                requirement_files=None,
+                constraint_files=None,
+                allow_prereleases=False,
+                transitive=True,
+                interpreters=None,
+                platforms=None,
+                indexes=None,
+                find_links=None,
+                network_configuration=None,
+                cache=None,
+                build=True,
+                use_wheel=True,
+                manylinux=None,
+                dest=None,
+                max_parallel_jobs=None):
+  """Resolves the URLs of all the distributions needed to meet requirements.
+
+  :keyword requirements: A sequence of requirement strings.
+  :type requirements: list of str
+  :keyword requirement_files: A sequence of requirement file paths.
+  :type requirement_files: list of str
+  :keyword constraint_files: A sequence of constraint file paths.
+  :type constraint_files: list of str
+  :keyword bool allow_prereleases: Whether to include pre-release and development versions when
+    resolving requirements. Defaults to ``False``, but any requirements that explicitly request
+    prerelease or development versions will override this setting.
+  :keyword bool transitive: Whether to resolve transitive dependencies of requirements.
+    Defaults to ``True``.
+  :keyword interpreters: The interpreters to use for building distributions and for testing
+    distribution compatibility. Defaults to the current interpreter.
+  :type interpreters: list of :class:`pex.interpreter.PythonInterpreter`
+  :keyword platforms: An iterable of PEP425-compatible platform strings to resolve distributions
+    for. If ``None`` (the default) or an empty iterable, use the platforms of the given
+    interpreters.
+  :type platforms: list of str
+  :keyword indexes: A list of urls or paths pointing to PEP 503 compliant repositories to search for
+    distributions. Defaults to ``None`` which indicates to use the default pypi index. To turn off
+    use of all indexes, pass an empty list.
+  :type indexes: list of str
+  :keyword find_links: A list or URLs, paths to local html files or directory paths. If URLs or
+    local html file paths, these are parsed for links to distributions. If a local directory path,
+    its listing is used to discover distributons.
+  :type find_links: list of str
+  :keyword network_configuration: Configuration for network requests made downloading and building
+    distributions.
+  :type network_configuration: :class:`pex.network_configuration.NetworkConfiguration`
+  :keyword str cache: A directory path to use to cache distributions locally.
+  :keyword bool build: Whether to allow building source distributions when no wheel is found.
+    Defaults to ``True``.
+  :keyword bool use_wheel: Whether to allow resolution of pre-built wheel distributions.
+    Defaults to ``True``.
+  :keyword str manylinux: The upper bound manylinux standard to support when targeting foreign linux
+    platforms. Defaults to ``None``.
+  :keyword str dest: A directory path to download distributions to.
+  :keyword int max_parallel_jobs: The maximum number of parallel jobs to use when resolving,
+    building and installing distributions in a resolve. Defaults to the number of CPUs available.
+  :raises Unsatisfiable: If the resolution of download of distributions fails for any reason.
+  :returns: List of :class:`LocalDistribution` instances meeting ``requirements``.
+  """
+
+  url_resolve_results = _url_resolve_internal(
+    interpreters=interpreters,
+    platforms=platforms,
+    requirements=requirements,
+    requirement_files=requirement_files,
+    constraint_files=constraint_files,
+    allow_prereleases=allow_prereleases,
+    transitive=transitive,
+    indexes=indexes,
+    find_links=find_links,
+    network_configuration=network_configuration,
+    cache=cache,
+    build=build,
+    use_wheel=use_wheel,
+    manylinux=manylinux,
+    dest=dest,
+    max_parallel_jobs=max_parallel_jobs
+  )
+  return url_resolve_results
 
 
 def download(requirements=None,

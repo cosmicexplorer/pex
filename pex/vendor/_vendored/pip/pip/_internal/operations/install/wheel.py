@@ -1,13 +1,11 @@
 """Support for installing and building the "wheel" binary package format.
 """
 
-# The following comment should be removed at some point in the future.
-# mypy: strict-optional=False
-
 from __future__ import absolute_import
 
 import collections
 import compileall
+import contextlib
 import csv
 import logging
 import os.path
@@ -17,45 +15,67 @@ import stat
 import sys
 import warnings
 from base64 import urlsafe_b64encode
-from email.parser import Parser
+from itertools import starmap
+from zipfile import ZipFile
 
 from pip._vendor import pkg_resources
 from pip._vendor.distlib.scripts import ScriptMaker
 from pip._vendor.distlib.util import get_export_entry
-from pip._vendor.packaging.utils import canonicalize_name
-from pip._vendor.six import StringIO
+from pip._vendor.six import (
+    PY2,
+    StringIO,
+    ensure_str,
+    ensure_text,
+    itervalues,
+    text_type,
+)
 
-from pip._internal.exceptions import InstallationError, UnsupportedWheel
+from pip._internal.exceptions import InstallationError
 from pip._internal.locations import get_major_minor_version
+from pip._internal.models.direct_url import DIRECT_URL_METADATA_NAME, DirectUrl
+from pip._internal.utils.filesystem import adjacent_tmp_file, replace
 from pip._internal.utils.misc import captured_stdout, ensure_dir, hash_file
 from pip._internal.utils.temp_dir import TempDirectory
 from pip._internal.utils.typing import MYPY_CHECK_RUNNING
-from pip._internal.utils.unpacking import unpack_file
+from pip._internal.utils.unpacking import current_umask, unpack_file
+from pip._internal.utils.wheel import parse_wheel
 
-if MYPY_CHECK_RUNNING:
+# Use the custom cast function at runtime to make cast work,
+# and import typing.cast when performing pre-commit and type
+# checks
+if not MYPY_CHECK_RUNNING:
+    from pip._internal.utils.typing import cast
+else:
+    from email.message import Message
     from typing import (
-        Dict, List, Optional, Sequence, Tuple, IO, Text, Any,
-        Iterable, Callable, Set,
+        Any,
+        Callable,
+        Dict,
+        IO,
+        Iterable,
+        Iterator,
+        List,
+        NewType,
+        Optional,
+        Sequence,
+        Set,
+        Tuple,
+        Union,
+        cast,
     )
 
     from pip._internal.models.scheme import Scheme
+    from pip._internal.utils.filesystem import NamedTemporaryFileResult
 
-    InstalledCSVRow = Tuple[str, ...]
-
-
-VERSION_COMPATIBLE = (1, 0)
+    RecordPath = NewType('RecordPath', text_type)
+    InstalledCSVRow = Tuple[RecordPath, str, Union[int, str]]
 
 
 logger = logging.getLogger(__name__)
 
 
-def normpath(src, p):
-    # type: (str, str) -> str
-    return os.path.relpath(src, p).replace(os.path.sep, '/')
-
-
 def rehash(path, blocksize=1 << 20):
-    # type: (str, int) -> Tuple[str, str]
+    # type: (text_type, int) -> Tuple[str, str]
     """Return (encoded_digest, length) for path using hashlib.sha256()"""
     h, length = hash_file(path, blocksize)
     digest = 'sha256=' + urlsafe_b64encode(
@@ -65,19 +85,19 @@ def rehash(path, blocksize=1 << 20):
     return (digest, str(length))  # type: ignore
 
 
-def open_for_csv(name, mode):
-    # type: (str, Text) -> IO[Any]
-    if sys.version_info[0] < 3:
-        nl = {}  # type: Dict[str, Any]
-        bin = 'b'
+def csv_io_kwargs(mode):
+    # type: (str) -> Dict[str, Any]
+    """Return keyword arguments to properly open a CSV file
+    in the given mode.
+    """
+    if PY2:
+        return {'mode': '{}b'.format(mode)}
     else:
-        nl = {'newline': ''}  # type: Dict[str, Any]
-        bin = ''
-    return open(name, mode + bin, **nl)
+        return {'mode': mode, 'newline': '', 'encoding': 'utf-8'}
 
 
 def fix_script(path):
-    # type: (str) -> Optional[bool]
+    # type: (text_type) -> Optional[bool]
     """Replace #!python with #!/path/to/python
     Return True if file was changed.
     """
@@ -97,23 +117,9 @@ def fix_script(path):
     return None
 
 
-dist_info_re = re.compile(r"""^(?P<namever>(?P<name>.+?)(-(?P<ver>.+?))?)
-                                \.dist-info$""", re.VERBOSE)
-
-
-def root_is_purelib(name, wheeldir):
-    # type: (str, str) -> bool
-    """True if the extracted wheel in wheeldir should go into purelib."""
-    name_folded = name.replace("-", "_")
-    for item in os.listdir(wheeldir):
-        match = dist_info_re.match(item)
-        if match and match.group('name') == name_folded:
-            with open(os.path.join(wheeldir, item, 'WHEEL')) as wheel:
-                for line in wheel:
-                    line = line.lower().rstrip()
-                    if line == "root-is-purelib: true":
-                        return True
-    return False
+def wheel_root_is_purelib(metadata):
+    # type: (Message) -> bool
+    return metadata.get("Root-Is-Purelib", "").lower() == "true"
 
 
 def get_entrypoints(filename):
@@ -222,9 +228,12 @@ def message_about_scripts_not_on_PATH(scripts):
     return "\n".join(msg_lines)
 
 
-def sorted_outrows(outrows):
-    # type: (Iterable[InstalledCSVRow]) -> List[InstalledCSVRow]
-    """Return the given rows of a RECORD file in sorted order.
+def _normalized_outrows(outrows):
+    # type: (Iterable[InstalledCSVRow]) -> List[Tuple[str, str, str]]
+    """Normalize the given rows of a RECORD file.
+
+    Items in each row are converted into str. Rows are then sorted to make
+    the value more predictable for tests.
 
     Each row is a 3-tuple (path, hash, size) and corresponds to a record of
     a RECORD file (see PEP 376 and PEP 427 for details).  For the rows
@@ -239,13 +248,35 @@ def sorted_outrows(outrows):
     # coerce each element to a string to avoid a TypeError in this case.
     # For additional background, see--
     # https://github.com/pypa/pip/issues/5868
-    return sorted(outrows, key=lambda row: tuple(str(x) for x in row))
+    return sorted(
+        (ensure_str(record_path, encoding='utf-8'), hash_, str(size))
+        for record_path, hash_, size in outrows
+    )
+
+
+def _record_to_fs_path(record_path):
+    # type: (RecordPath) -> text_type
+    return record_path
+
+
+def _fs_to_record_path(path, relative_to=None):
+    # type: (text_type, Optional[text_type]) -> RecordPath
+    if relative_to is not None:
+        path = os.path.relpath(path, relative_to)
+    path = path.replace(os.path.sep, '/')
+    return cast('RecordPath', path)
+
+
+def _parse_record_path(record_column):
+    # type: (str) -> RecordPath
+    p = ensure_text(record_column, encoding='utf-8')
+    return cast('RecordPath', p)
 
 
 def get_csv_rows_for_installed(
     old_csv_rows,  # type: Iterable[List[str]]
-    installed,  # type: Dict[str, str]
-    changed,  # type: Set[str]
+    installed,  # type: Dict[RecordPath, RecordPath]
+    changed,  # type: Set[RecordPath]
     generated,  # type: List[str]
     lib_dir,  # type: str
 ):
@@ -260,21 +291,20 @@ def get_csv_rows_for_installed(
             logger.warning(
                 'RECORD line has more than three elements: {}'.format(row)
             )
-        # Make a copy because we are mutating the row.
-        row = list(row)
-        old_path = row[0]
-        new_path = installed.pop(old_path, old_path)
-        row[0] = new_path
-        if new_path in changed:
-            digest, length = rehash(new_path)
-            row[1] = digest
-            row[2] = length
-        installed_rows.append(tuple(row))
+        old_record_path = _parse_record_path(row[0])
+        new_record_path = installed.pop(old_record_path, old_record_path)
+        if new_record_path in changed:
+            digest, length = rehash(_record_to_fs_path(new_record_path))
+        else:
+            digest = row[1] if len(row) > 1 else ''
+            length = row[2] if len(row) > 2 else ''
+        installed_rows.append((new_record_path, digest, length))
     for f in generated:
+        path = _fs_to_record_path(f, lib_dir)
         digest, length = rehash(f)
-        installed_rows.append((normpath(f, lib_dir), digest, str(length)))
-    for f in installed:
-        installed_rows.append((installed[f], '', ''))
+        installed_rows.append((path, digest, length))
+    for installed_record_path in itervalues(installed):
+        installed_rows.append((installed_record_path, '', ''))
     return installed_rows
 
 
@@ -299,16 +329,19 @@ class PipScriptMaker(ScriptMaker):
 def install_unpacked_wheel(
     name,  # type: str
     wheeldir,  # type: str
+    wheel_zip,  # type: ZipFile
     scheme,  # type: Scheme
     req_description,  # type: str
     pycompile=True,  # type: bool
-    warn_script_location=True  # type: bool
+    warn_script_location=True,  # type: bool
+    direct_url=None,  # type: Optional[DirectUrl]
 ):
     # type: (...) -> None
     """Install a wheel.
 
     :param name: Name of the project to install
     :param wheeldir: Base directory of the unpacked wheel
+    :param wheel_zip: open ZipFile for wheel being installed
     :param scheme: Distutils scheme dictating the install directories
     :param req_description: String used in place of the requirement, for
         logging
@@ -324,24 +357,24 @@ def install_unpacked_wheel(
     # TODO: Look into moving this into a dedicated class for representing an
     #       installation.
 
-    version = wheel_version(wheeldir)
-    check_compatibility(version, name)
+    source = wheeldir.rstrip(os.path.sep) + os.path.sep
 
-    if root_is_purelib(name, wheeldir):
+    info_dir, metadata = parse_wheel(wheel_zip, name)
+
+    if wheel_root_is_purelib(metadata):
         lib_dir = scheme.purelib
     else:
         lib_dir = scheme.platlib
 
-    info_dir = []  # type: List[str]
-    data_dirs = []
-    source = wheeldir.rstrip(os.path.sep) + os.path.sep
+    subdirs = os.listdir(source)
+    data_dirs = [s for s in subdirs if s.endswith('.data')]
 
     # Record details of the files moved
     #   installed = files copied from the wheel to the destination
     #   changed = files changed while installing (scripts #! line typically)
     #   generated = files newly generated during the install (script wrappers)
-    installed = {}  # type: Dict[str, str]
-    changed = set()
+    installed = {}  # type: Dict[RecordPath, RecordPath]
+    changed = set()  # type: Set[RecordPath]
     generated = []  # type: List[str]
 
     # Compile all of the pyc files that we're going to be installing
@@ -353,20 +386,20 @@ def install_unpacked_wheel(
         logger.debug(stdout.getvalue())
 
     def record_installed(srcfile, destfile, modified=False):
-        # type: (str, str, bool) -> None
+        # type: (text_type, text_type, bool) -> None
         """Map archive RECORD paths to installation RECORD paths."""
-        oldpath = normpath(srcfile, wheeldir)
-        newpath = normpath(destfile, lib_dir)
+        oldpath = _fs_to_record_path(srcfile, wheeldir)
+        newpath = _fs_to_record_path(destfile, lib_dir)
         installed[oldpath] = newpath
         if modified:
-            changed.add(destfile)
+            changed.add(_fs_to_record_path(destfile))
 
     def clobber(
-            source,  # type: str
-            dest,  # type: str
+            source,  # type: text_type
+            dest,  # type: text_type
             is_base,  # type: bool
-            fixer=None,  # type: Optional[Callable[[str], Any]]
-            filter=None  # type: Optional[Callable[[str], bool]]
+            fixer=None,  # type: Optional[Callable[[text_type], Any]]
+            filter=None  # type: Optional[Callable[[text_type], bool]]
     ):
         # type: (...) -> None
         ensure_dir(dest)  # common for the 'include' path
@@ -374,24 +407,8 @@ def install_unpacked_wheel(
         for dir, subdirs, files in os.walk(source):
             basedir = dir[len(source):].lstrip(os.path.sep)
             destdir = os.path.join(dest, basedir)
-            if is_base and basedir.split(os.path.sep, 1)[0].endswith('.data'):
-                continue
-            for s in subdirs:
-                destsubdir = os.path.join(dest, basedir, s)
-                if is_base and basedir == '' and destsubdir.endswith('.data'):
-                    data_dirs.append(s)
-                    continue
-                elif (
-                    is_base and
-                    basedir == '' and
-                    s.endswith('.dist-info')
-                ):
-                    assert not info_dir, (
-                        'Multiple .dist-info directories: {}, '.format(
-                            destsubdir
-                        ) + ', '.join(info_dir)
-                    )
-                    info_dir.append(destsubdir)
+            if is_base and basedir == '':
+                subdirs[:] = [s for s in subdirs if not s.endswith('.data')]
             for f in files:
                 # Skip unwanted files
                 if filter and filter(f):
@@ -441,27 +458,20 @@ def install_unpacked_wheel(
                     changed = fixer(destfile)
                 record_installed(srcfile, destfile, changed)
 
-    clobber(source, lib_dir, True)
-
-    assert info_dir, "{} .dist-info directory not found".format(
-        req_description
+    clobber(
+        ensure_text(source, encoding=sys.getfilesystemencoding()),
+        ensure_text(lib_dir, encoding=sys.getfilesystemencoding()),
+        True,
     )
 
-    info_dir_name = canonicalize_name(os.path.basename(info_dir[0]))
-    canonical_name = canonicalize_name(name)
-    if not info_dir_name.startswith(canonical_name):
-        raise UnsupportedWheel(
-            "{} .dist-info directory {!r} does not start with {!r}".format(
-                req_description, os.path.basename(info_dir[0]), canonical_name
-            )
-        )
+    dest_info_dir = os.path.join(lib_dir, info_dir)
 
     # Get the defined entry points
-    ep_file = os.path.join(info_dir[0], 'entry_points.txt')
+    ep_file = os.path.join(dest_info_dir, 'entry_points.txt')
     console, gui = get_entrypoints(ep_file)
 
     def is_entrypoint_wrapper(name):
-        # type: (str) -> bool
+        # type: (text_type) -> bool
         # EP, EP.exe and EP-script.py are scripts generated for
         # entry point EP by setuptools
         if name.lower().endswith('.exe'):
@@ -485,7 +495,13 @@ def install_unpacked_wheel(
                 filter = is_entrypoint_wrapper
             source = os.path.join(wheeldir, datadir, subdir)
             dest = getattr(scheme, subdir)
-            clobber(source, dest, False, fixer=fixer, filter=filter)
+            clobber(
+                ensure_text(source, encoding=sys.getfilesystemencoding()),
+                ensure_text(dest, encoding=sys.getfilesystemencoding()),
+                False,
+                fixer=fixer,
+                filter=filter,
+            )
 
     maker = PipScriptMaker(None, scheme.scripts)
 
@@ -545,11 +561,11 @@ def install_unpacked_wheel(
 
         if os.environ.get("ENSUREPIP_OPTIONS", "") != "altinstall":
             scripts_to_generate.append(
-                'pip%s = %s' % (sys.version_info[0], pip_script)
+                'pip{} = {}'.format(sys.version_info[0], pip_script)
             )
 
         scripts_to_generate.append(
-            'pip%s = %s' % (get_major_minor_version(), pip_script)
+            'pip{} = {}'.format(get_major_minor_version(), pip_script)
         )
         # Delete any other versioned pip entry points
         pip_ep = [k for k in console if re.match(r'pip(\d(\.\d)?)?$', k)]
@@ -563,7 +579,7 @@ def install_unpacked_wheel(
             )
 
         scripts_to_generate.append(
-            'easy_install-%s = %s' % (
+            'easy_install-{} = {}'.format(
                 get_major_minor_version(), easy_install_script
             )
         )
@@ -575,13 +591,9 @@ def install_unpacked_wheel(
             del console[k]
 
     # Generate the console and GUI entry points specified in the wheel
-    scripts_to_generate.extend(
-        '%s = %s' % kv for kv in console.items()
-    )
+    scripts_to_generate.extend(starmap('{} = {}'.format, console.items()))
 
-    gui_scripts_to_generate = [
-        '%s = %s' % kv for kv in gui.items()
-    ]
+    gui_scripts_to_generate = list(starmap('{} = {}'.format, gui.items()))
 
     generated_console_scripts = []  # type: List[str]
 
@@ -606,29 +618,44 @@ def install_unpacked_wheel(
         if msg is not None:
             logger.warning(msg)
 
+    generated_file_mode = 0o666 & ~current_umask()
+
+    @contextlib.contextmanager
+    def _generate_file(path, **kwargs):
+        # type: (str, **Any) -> Iterator[NamedTemporaryFileResult]
+        with adjacent_tmp_file(path, **kwargs) as f:
+            yield f
+        os.chmod(f.name, generated_file_mode)
+        replace(f.name, path)
+
     # Record pip as the installer
-    installer = os.path.join(info_dir[0], 'INSTALLER')
-    temp_installer = os.path.join(info_dir[0], 'INSTALLER.pip')
-    with open(temp_installer, 'wb') as installer_file:
+    installer_path = os.path.join(dest_info_dir, 'INSTALLER')
+    with _generate_file(installer_path) as installer_file:
         installer_file.write(b'pip\n')
-    shutil.move(temp_installer, installer)
-    generated.append(installer)
+    generated.append(installer_path)
+
+    # Record the PEP 610 direct URL reference
+    if direct_url is not None:
+        direct_url_path = os.path.join(dest_info_dir, DIRECT_URL_METADATA_NAME)
+        with _generate_file(direct_url_path) as direct_url_file:
+            direct_url_file.write(direct_url.to_json().encode("utf-8"))
+        generated.append(direct_url_path)
 
     # Record details of all files installed
-    record = os.path.join(info_dir[0], 'RECORD')
-    temp_record = os.path.join(info_dir[0], 'RECORD.pip')
-    with open_for_csv(record, 'r') as record_in:
-        with open_for_csv(temp_record, 'w+') as record_out:
-            reader = csv.reader(record_in)
-            outrows = get_csv_rows_for_installed(
-                reader, installed=installed, changed=changed,
-                generated=generated, lib_dir=lib_dir,
-            )
-            writer = csv.writer(record_out)
-            # Sort to simplify testing.
-            for row in sorted_outrows(outrows):
-                writer.writerow(row)
-    shutil.move(temp_record, record)
+    record_path = os.path.join(dest_info_dir, 'RECORD')
+    with open(record_path, **csv_io_kwargs('r')) as record_file:
+        rows = get_csv_rows_for_installed(
+            csv.reader(record_file),
+            installed=installed,
+            changed=changed,
+            generated=generated,
+            lib_dir=lib_dir)
+    with _generate_file(record_path, **csv_io_kwargs('w')) as record_file:
+        # The type mypy infers for record_file is different for Python 3
+        # (typing.IO[Any]) and Python 2 (typing.BinaryIO). We explicitly
+        # cast to typing.IO[str] as a workaround.
+        writer = csv.writer(cast('IO[str]', record_file))
+        writer.writerows(_normalized_outrows(rows))
 
 
 def install_wheel(
@@ -639,64 +666,20 @@ def install_wheel(
     pycompile=True,  # type: bool
     warn_script_location=True,  # type: bool
     _temp_dir_for_testing=None,  # type: Optional[str]
+    direct_url=None,  # type: Optional[DirectUrl]
 ):
     # type: (...) -> None
     with TempDirectory(
         path=_temp_dir_for_testing, kind="unpacked-wheel"
-    ) as unpacked_dir:
+    ) as unpacked_dir, ZipFile(wheel_path, allowZip64=True) as z:
         unpack_file(wheel_path, unpacked_dir.path)
         install_unpacked_wheel(
             name=name,
             wheeldir=unpacked_dir.path,
+            wheel_zip=z,
             scheme=scheme,
             req_description=req_description,
             pycompile=pycompile,
             warn_script_location=warn_script_location,
-        )
-
-
-def wheel_version(source_dir):
-    # type: (Optional[str]) -> Optional[Tuple[int, ...]]
-    """Return the Wheel-Version of an extracted wheel, if possible.
-    Otherwise, return None if we couldn't parse / extract it.
-    """
-    try:
-        dist = [d for d in pkg_resources.find_on_path(None, source_dir)][0]
-
-        wheel_data = dist.get_metadata('WHEEL')
-        wheel_data = Parser().parsestr(wheel_data)
-
-        version = wheel_data['Wheel-Version'].strip()
-        version = tuple(map(int, version.split('.')))
-        return version
-    except Exception:
-        return None
-
-
-def check_compatibility(version, name):
-    # type: (Optional[Tuple[int, ...]], str) -> None
-    """Raises errors or warns if called with an incompatible Wheel-Version.
-
-    Pip should refuse to install a Wheel-Version that's a major series
-    ahead of what it's compatible with (e.g 2.0 > 1.1); and warn when
-    installing a version only minor version ahead (e.g 1.2 > 1.1).
-
-    version: a 2-tuple representing a Wheel-Version (Major, Minor)
-    name: name of wheel or package to raise exception about
-
-    :raises UnsupportedWheel: when an incompatible Wheel-Version is given
-    """
-    if not version:
-        raise UnsupportedWheel(
-            "%s is in an unsupported or invalid wheel" % name
-        )
-    if version[0] > VERSION_COMPATIBLE[0]:
-        raise UnsupportedWheel(
-            "%s's Wheel-Version (%s) is not compatible with this version "
-            "of pip" % (name, '.'.join(map(str, version)))
-        )
-    elif version > VERSION_COMPATIBLE:
-        logger.warning(
-            'Installing from a newer Wheel-Version (%s)',
-            '.'.join(map(str, version)),
+            direct_url=direct_url,
         )

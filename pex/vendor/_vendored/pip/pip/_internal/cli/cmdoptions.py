@@ -21,6 +21,7 @@ from functools import partial
 from optparse import SUPPRESS_HELP, Option, OptionGroup
 from textwrap import dedent
 
+from pip._internal.cli.progress_bars import BAR_TYPES
 from pip._internal.exceptions import CommandError
 from pip._internal.locations import USER_CACHE_DIR, get_src_prefix
 from pip._internal.models.format_control import FormatControl
@@ -28,7 +29,6 @@ from pip._internal.models.index import PyPI
 from pip._internal.models.target_python import TargetPython
 from pip._internal.utils.hashes import STRONG_HASHES
 from pip._internal.utils.typing import MYPY_CHECK_RUNNING
-from pip._internal.utils.ui import BAR_TYPES
 
 if MYPY_CHECK_RUNNING:
     from typing import Any, Callable, Dict, Optional, Tuple
@@ -99,7 +99,7 @@ def check_dist_restriction(options, check_target=False):
     """
     dist_restriction_set = any([
         options.python_version,
-        options.platforms,
+        options.platform,
         options.abi,
         options.implementation,
     ])
@@ -110,17 +110,18 @@ def check_dist_restriction(options, check_target=False):
         not options.ignore_dependencies
     )
 
-    # Installations or downloads using dist restrictions must not combine
-    # source distributions and dist-specific wheels, as they are not
-    # guaranteed to be locally compatible.
-    if dist_restriction_set and sdist_dependencies_allowed:
-        raise CommandError(
-            "When restricting platform and interpreter constraints using "
-            "--python-version, --platform, --abi, or --implementation, "
-            "either --no-deps must be set, or --only-binary=:all: must be "
-            "set and --no-binary must not be set (or must be set to "
-            ":none:)."
-        )
+    # FIXME: this breaks multiplatform `pip resolve`s!
+    # # Installations or downloads using dist restrictions must not combine
+    # # source distributions and dist-specific wheels, as they are not
+    # # guaranteed to be locally compatible.
+    # if dist_restriction_set and sdist_dependencies_allowed:
+    #     raise CommandError(
+    #         "When restricting platform and interpreter constraints using "
+    #         "--python-version, --platform, --abi, or --implementation, "
+    #         "either --no-deps must be set, or --only-binary=:all: must be "
+    #         "set and --no-binary must not be set (or must be set to "
+    #         ":none:)."
+    #     )
 
     if check_target:
         if dist_restriction_set and not options.target_dir:
@@ -128,6 +129,17 @@ def check_dist_restriction(options, check_target=False):
                 "Can not use any platform or abi specific options unless "
                 "installing via '--target'"
             )
+
+
+def _path_option_check(option, opt, value):
+    # type: (Option, str, str) -> str
+    return os.path.expanduser(value)
+
+
+class PipOption(Option):
+    TYPES = Option.TYPES + ("path",)
+    TYPE_CHECKER = Option.TYPE_CHECKER.copy()
+    TYPE_CHECKER["path"] = _path_option_check
 
 
 ###########
@@ -217,10 +229,11 @@ progress_bar = partial(
 )  # type: Callable[..., Option]
 
 log = partial(
-    Option,
+    PipOption,
     "--log", "--log-file", "--local-log",
     dest="log",
     metavar="path",
+    type="path",
     help="Path to a verbose appending log."
 )  # type: Callable[..., Option]
 
@@ -263,16 +276,6 @@ timeout = partial(
     help='Set the socket timeout (default %default seconds).',
 )  # type: Callable[..., Option]
 
-skip_requirements_regex = partial(
-    Option,
-    # A regex to be used to skip requirements
-    '--skip-requirements-regex',
-    dest='skip_requirements_regex',
-    type='str',
-    default='',
-    help=SUPPRESS_HELP,
-)  # type: Callable[..., Option]
-
 
 def exists_action():
     # type: () -> Option
@@ -291,19 +294,19 @@ def exists_action():
 
 
 cert = partial(
-    Option,
+    PipOption,
     '--cert',
     dest='cert',
-    type='str',
+    type='path',
     metavar='path',
     help="Path to alternate CA bundle.",
 )  # type: Callable[..., Option]
 
 client_cert = partial(
-    Option,
+    PipOption,
     '--client-cert',
     dest='client_cert',
-    type='str',
+    type='path',
     default=None,
     metavar='path',
     help="Path to SSL client certificate, a single file containing the "
@@ -321,19 +324,6 @@ index_url = partial(
          "(the simple repository API) or a local directory laid out "
          "in the same format.",
 )  # type: Callable[..., Option]
-
-
-def headers():
-    # type: () -> Option
-    return Option(
-        '-H', '--header',
-        dest='headers',
-        action='append',
-        metavar='KEY:VAL',
-        default=[],
-        help='HTTP header to include in all requests. This option can be used '
-             'multiple times. Conflicts with --extra-index-url.',
-    )
 
 
 def extra_index_url():
@@ -368,9 +358,11 @@ def find_links():
         action='append',
         default=[],
         metavar='url',
-        help="If a url or path to an html file, then parse for links to "
-             "archives. If a local path or file:// url that's a directory, "
-             "then look for archives in the directory listing.",
+        help="If a URL or path to an html file, then parse for links to "
+             "archives such as sdist (.tar.gz) or wheel (.whl) files. "
+             "If a local path or file:// URL that's a directory,  "
+             "then look for archives in the directory listing. "
+             "Links to VCS project URLs are not supported.",
     )
 
 
@@ -433,10 +425,10 @@ def _handle_src(option, opt_str, value, parser):
 
 
 src = partial(
-    Option,
+    PipOption,
     '--src', '--source', '--source-dir', '--source-directory',
     dest='src_dir',
-    type='str',
+    type='path',
     metavar='dir',
     default=get_src_prefix(),
     action='callback',
@@ -476,12 +468,12 @@ def no_binary():
         "--no-binary", dest="format_control", action="callback",
         callback=_handle_no_binary, type="str",
         default=format_control,
-        help="Do not use binary packages. Can be supplied multiple times, and "
-             "each time adds to the existing value. Accepts either :all: to "
-             "disable all binary packages, :none: to empty the set, or one or "
-             "more package names with commas between them (no colons). Note "
-             "that some packages are tricky to compile and may fail to "
-             "install when this option is used on them.",
+        help='Do not use binary packages. Can be supplied multiple times, and '
+             'each time adds to the existing value. Accepts either ":all:" to '
+             'disable all binary packages, ":none:" to empty the set (notice '
+             'the colons), or one or more package names with commas between '
+             'them (no colons). Note that some packages are tricky to compile '
+             'and may fail to install when this option is used on them.',
     )
 
 
@@ -492,25 +484,23 @@ def only_binary():
         "--only-binary", dest="format_control", action="callback",
         callback=_handle_only_binary, type="str",
         default=format_control,
-        help="Do not use source packages. Can be supplied multiple times, and "
-             "each time adds to the existing value. Accepts either :all: to "
-             "disable all source packages, :none: to empty the set, or one or "
-             "more package names with commas between them. Packages without "
-             "binary distributions will fail to install when this option is "
-             "used on them.",
+        help='Do not use source packages. Can be supplied multiple times, and '
+             'each time adds to the existing value. Accepts either ":all:" to '
+             'disable all source packages, ":none:" to empty the set, or one '
+             'or more package names with commas between them. Packages '
+             'without binary distributions will fail to install when this '
+             'option is used on them.',
     )
 
 
 platform = partial(
     Option,
     '--platform',
-    dest='platforms',
+    dest='platform',
     metavar='platform',
-    action='append',
     default=None,
     help=("Only use wheels compatible with <platform>. "
-          "Defaults to the platform of the running system. "
-          "This option can be used multiple times."),
+          "Defaults to the platform of the running system."),
 )  # type: Callable[..., Option]
 
 
@@ -620,7 +610,7 @@ def add_target_python_options(cmd_opts):
 def make_target_python(options):
     # type: (Values) -> TargetPython
     target_python = TargetPython(
-        platforms=options.platforms,
+        platform=options.platform,
         py_version_info=options.python_version,
         abi=options.abi,
         implementation=options.implementation,
@@ -641,11 +631,12 @@ def prefer_binary():
 
 
 cache_dir = partial(
-    Option,
+    PipOption,
     "--cache-dir",
     dest="cache_dir",
     default=USER_CACHE_DIR,
     metavar="dir",
+    type='path',
     help="Store the cache data in <dir>."
 )  # type: Callable[..., Option]
 
@@ -704,11 +695,21 @@ def _handle_build_dir(option, opt, value, parser):
     setattr(parser.values, option.dest, value)
 
 
-build_dir = partial(
+quickly_parse_sub_requirements = partial(
     Option,
+    '--quickly-parse-sub-requirements',
+    dest='quickly_parse_sub_requirements',
+    action='store_true',
+    default=False,
+    help='Enable an experimental mode to download more packages in parallel.',
+)  # type: Callable[..., Option]
+
+
+build_dir = partial(
+    PipOption,
     '-b', '--build', '--build-dir', '--build-directory',
     dest='build_dir',
-    type='str',
+    type='path',
     metavar='dir',
     action='callback',
     callback=_handle_build_dir,
@@ -853,12 +854,12 @@ def _handle_merge_hash(option, opt_str, value, parser):
     try:
         algo, digest = value.split(':', 1)
     except ValueError:
-        parser.error('Arguments to %s must be a hash name '
-                     'followed by a value, like --hash=sha256:abcde...' %
-                     opt_str)
+        parser.error('Arguments to {} must be a hash name '
+                     'followed by a value, like --hash=sha256:'
+                     'abcde...'.format(opt_str))
     if algo not in STRONG_HASHES:
-        parser.error('Allowed hash algorithms for %s are %s.' %
-                     (opt_str, ', '.join(STRONG_HASHES)))
+        parser.error('Allowed hash algorithms for {} are {}.'.format(
+                     opt_str, ', '.join(STRONG_HASHES)))
     parser.values.hashes.setdefault(algo, []).append(digest)
 
 
@@ -889,9 +890,10 @@ require_hashes = partial(
 
 
 list_path = partial(
-    Option,
+    PipOption,
     '--path',
     dest='path',
+    type='path',
     action='append',
     help='Restrict to the specified installation path for listing '
          'packages (can be used multiple times).'
@@ -916,6 +918,19 @@ no_python_version_warning = partial(
 )  # type: Callable[..., Option]
 
 
+unstable_feature = partial(
+    Option,
+    '--unstable-feature',
+    dest='unstable_features',
+    metavar='feature',
+    action='append',
+    default=[],
+    choices=['resolver'],
+    help=SUPPRESS_HELP,  # TODO: Enable this when the resolver actually works.
+    # help='Enable unstable feature(s) that may be backward incompatible.',
+)  # type: Callable[..., Option]
+
+
 ##########
 # groups #
 ##########
@@ -925,7 +940,6 @@ general_group = {
     'options': [
         help_,
         isolated_mode,
-        headers,
         require_virtualenv,
         verbose,
         version,
@@ -935,7 +949,6 @@ general_group = {
         proxy,
         retries,
         timeout,
-        skip_requirements_regex,
         exists_action,
         trusted_host,
         cert,
@@ -945,6 +958,7 @@ general_group = {
         disable_pip_version_check,
         no_color,
         no_python_version_warning,
+        unstable_feature,
     ]
 }  # type: Dict[str, Any]
 

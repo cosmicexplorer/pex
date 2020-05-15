@@ -5,6 +5,7 @@
 from __future__ import absolute_import, print_function
 
 import os
+import subprocess
 from collections import deque
 from textwrap import dedent
 
@@ -59,7 +60,8 @@ class Pip(object):
   def __init__(self, pip_pex_path):
     self._pip_pex_path = pip_pex_path
 
-  def _spawn_pip_isolated(self, args, cache=None, interpreter=None):
+  def _spawn_pip_isolated(self, args, cache=None, interpreter=None,
+                          pex_verbosity=None, **pex_run_kwargs):
     pip_args = [
       # We vendor the version of pip we want so pip should never check for updates.
       '--disable-pip-version-check',
@@ -72,7 +74,7 @@ class Pip(object):
     ]
 
     # The max pip verbosity is -vvv and for pex it's -vvvvvvvvv; so we scale down by a factor of 3.
-    pex_verbosity = ENV.PEX_VERBOSE
+    pex_verbosity = pex_verbosity or ENV.PEX_VERBOSE
     pip_verbosity = pex_verbosity // 3
     if pip_verbosity > 0:
       pip_args.append('-{}'.format('v' * pip_verbosity))
@@ -99,8 +101,8 @@ class Pip(object):
         process=pip.run(
           args=command,
           env=env,
-          blocking=False
-        )
+          blocking=False,
+          **pex_run_kwargs)
       )
 
   def _calculate_package_index_options(
@@ -132,6 +134,7 @@ class Pip(object):
             yield '--extra-index-url'
             yield maybe_trust_insecure_host(extra_index)
 
+    # import pdb; pdb.set_trace()
     if find_links:
       for find_link_url in find_links:
         yield '--find-links'
@@ -142,11 +145,6 @@ class Pip(object):
       yield trusted_host
 
     network_configuration = network_configuration or NetworkConfiguration.create()
-
-    # N.B.: Pip sends `Cache-Control: max-age=0` by default which turns of HTTP caching as per the
-    # spec:
-    yield '--header'
-    yield 'Cache-Control:max-age={}'.format(network_configuration.cache_ttl)
 
     for header in network_configuration.headers:
       yield '--header'
@@ -169,6 +167,71 @@ class Pip(object):
     if network_configuration.client_cert:
       yield '--client-cert'
       yield network_configuration.client_cert
+
+  def spawn_url_resolve_distributions(self,
+                                      download_dir,
+                                      requirements=None,
+                                      requirement_files=None,
+                                      constraint_files=None,
+                                      allow_prereleases=False,
+                                      transitive=True,
+                                      target=None,
+                                      indexes=None,
+                                      find_links=None,
+                                      network_configuration=None,
+                                      cache=None,
+                                      build=True,
+                                      manylinux=None,
+                                      use_wheel=True):
+
+    target = target or DistributionTarget.current()
+
+    platform = target.get_platform()
+    if not use_wheel:
+      if not build:
+        raise ValueError('Cannot both ignore wheels (use_wheel=False) and refrain from building '
+                         'distributions (build=False).')
+      elif target.is_foreign:
+        raise ValueError('Cannot ignore wheels (use_wheel=False) when resolving for a foreign '
+                         'platform: {}'.format(platform))
+
+    download_cmd = ['resolve', '--dest', download_dir,
+                    # '--external-package-link-processor',
+                    '--v1',
+                    '--quickly-parse-sub-requirements']
+    # import pdb; pdb.set_trace()
+    package_index_options = self._calculate_package_index_options(
+      indexes=indexes,
+      find_links=find_links,
+      network_configuration=network_configuration,
+    )
+    download_cmd.extend(package_index_options)
+
+    if manylinux and platform.platform.startswith('linux'):
+      download_cmd.extend(['--platform', platform.platform.replace('linux', manylinux, 1)])
+    download_cmd.extend(['--platform', platform.platform])
+    download_cmd.extend(['--implementation', platform.impl])
+    download_cmd.extend(['--python-version', platform.version])
+    download_cmd.extend(['--abi', platform.abi])
+
+    if allow_prereleases:
+      download_cmd.append('--pre')
+
+    # download_cmd.append('--no-deps')
+
+    if requirement_files:
+      for requirement_file in requirement_files:
+        download_cmd.extend(['--requirement', requirement_file])
+
+    if constraint_files:
+      for constraint_file in constraint_files:
+        download_cmd.extend(['--constraint', constraint_file])
+
+    download_cmd.extend(requirements)
+
+    return self._spawn_pip_isolated(download_cmd, cache=cache, interpreter=target.get_interpreter(),
+                                    pex_verbosity=0,
+                                    stdout=subprocess.PIPE)
 
   def spawn_download_distributions(self,
                                    download_dir,

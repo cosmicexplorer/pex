@@ -215,11 +215,11 @@ class MultiDomainBasicAuth(AuthBase):
 
     # Factored out to allow for easy patching in tests
     def _prompt_for_password(self, netloc):
-        username = ask_input("User for %s: " % netloc)
+        username = ask_input("User for {}: ".format(netloc))
         if not username:
             return None, None
         auth = get_keyring_auth(netloc, username)
-        if auth:
+        if auth and auth[0] is not None and auth[1] is not None:
             return auth[0], auth[1], False
         password = ask_password("Password: ")
         return username, password, True
