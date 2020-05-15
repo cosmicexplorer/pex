@@ -99,7 +99,7 @@ def iter_vendor_specs():
 
   # We shell out to pip at buildtime to resolve and install dependencies.
   # N.B.: This is pip 20.2.dev0+resolve with a patch for blazing fast resolves!!!
-  yield VendorSpec.vcs('git+https://github.com/cosmicexplorer/pip@c4f43766#egg=pip', rewrite=False)
+  yield VendorSpec.vcs('git+https://github.com/cosmicexplorer/pip@8e5f44ef#egg=pip', rewrite=False)
 
   # We expose this to pip at buildtime for legacy builds, but we also use pkg_resources via
   # pex.third_party at runtime in various ways.

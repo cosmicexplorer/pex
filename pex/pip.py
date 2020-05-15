@@ -5,6 +5,7 @@
 from __future__ import absolute_import, print_function
 
 import os
+import subprocess
 from collections import deque
 from textwrap import dedent
 
@@ -59,7 +60,7 @@ class Pip(object):
   def __init__(self, pip_pex_path):
     self._pip_pex_path = pip_pex_path
 
-  def _spawn_pip_isolated(self, args, cache=None, interpreter=None):
+  def _spawn_pip_isolated(self, args, cache=None, interpreter=None, **pex_run_kwargs):
     pip_args = [
       # We vendor the version of pip we want so pip should never check for updates.
       '--disable-pip-version-check',
@@ -99,8 +100,8 @@ class Pip(object):
         process=pip.run(
           args=command,
           env=env,
-          blocking=False
-        )
+          blocking=False,
+          **pex_run_kwargs)
       )
 
   def _calculate_package_index_options(
@@ -142,11 +143,6 @@ class Pip(object):
       yield trusted_host
 
     network_configuration = network_configuration or NetworkConfiguration.create()
-
-    # N.B.: Pip sends `Cache-Control: max-age=0` by default which turns of HTTP caching as per the
-    # spec:
-    yield '--header'
-    yield 'Cache-Control:max-age={}'.format(network_configuration.cache_ttl)
 
     for header in network_configuration.headers:
       yield '--header'
@@ -238,7 +234,8 @@ class Pip(object):
 
     download_cmd.extend(requirements)
 
-    return self._spawn_pip_isolated(download_cmd, cache=cache, interpreter=target.get_interpreter())
+    return self._spawn_pip_isolated(download_cmd, cache=cache, interpreter=target.get_interpreter(),
+                                    stdout=subprocess.PIPE)
 
   def spawn_download_distributions(self,
                                    download_dir,

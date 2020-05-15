@@ -732,7 +732,7 @@ class Resolver(BaseResolver):
         with indent_log():
             # We add req_to_install before its dependencies, so that we
             # can refer to it when adding dependencies.
-            if not requirement_set.has_requirement(req_to_install.name):
+            if not requirement_set.has_requirement(req_to_install.name or ''):
                 # 'unnamed' requirements will get added here
                 # 'unnamed' requirements can only come from being directly
                 # provided by the user.

@@ -284,8 +284,8 @@ def atomic_directory(target_dir, source=None):
   """A context manager that yields a new empty work directory path it will move to `target_dir`.
 
   :param str target_dir: The target directory to atomically update.
-  :param str source: An optional source offset into the work directory to use for the atomic update
-                     of the target directory. By default the whole work directory is used.
+  :param str source: An optional source (prefix?) into the work directory to use for the atomic
+                     update of the target directory. By default the whole work directory is used.
 
   If the `target_dir` already exists the enclosed block will be yielded `None` to signal there is
   no work to do.

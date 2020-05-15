@@ -290,6 +290,8 @@ class PEXEnvironment(Environment):
           distribution = DistributionHelper.distribution_from_path(
             path=os.path.join(self._pex_info.install_cache, dist_digest, dist_name)
           )
+          if distribution is None:
+              continue
           distributions_by_key[distribution.as_requirement().key].append(distribution)
 
       if not self._pex_info.ignore_errors:

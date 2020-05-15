@@ -367,6 +367,7 @@ class PEXBuilder(object):
       this will be inferred from the distribution itself should it be formatted in a standard way.
     :type dist: :class:`pkg_resources.Distribution`
     """
+    assert dist is not None
     self._ensure_unfrozen('Adding a distribution')
     dist_name = dist_name or os.path.basename(dist.location)
     self._distributions.add(dist)
@@ -403,8 +404,14 @@ class PEXBuilder(object):
         install_dir=dist_path,
         target=DistributionTarget.for_interpreter(self.interpreter)
       ).wait()
+      dist = DistributionHelper.distribution_from_path(dist_path)
+    else:
+      # NB: We need to be able to propagate the `name` argument to correctly disambiguate packages
+      # within a site-packages/ directory. This is not necessary to identity wheels.
+      dist = DistributionHelper.distribution_from_path(dist_path, name=name)
 
-    dist = DistributionHelper.distribution_from_path(dist_path)
+    assert dist is not None, 'failed to locate dist at {}'.format(dist_path)
+
     self.add_distribution(dist, dist_name=name)
     self.add_requirement(dist.as_requirement())
 

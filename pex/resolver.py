@@ -7,6 +7,7 @@ from __future__ import absolute_import
 import functools
 import json
 import os
+import re
 import subprocess
 import zipfile
 from collections import OrderedDict, defaultdict, namedtuple
@@ -196,11 +197,13 @@ class DownloadRequest(namedtuple('DownloadRequest', [
                                                           spawn_func=self._spawn_download)
 
   def url_resolve_distributions(self, dest=None, max_parallel_jobs=None):
-    return self._execute_parallel_pip_requirement_command(dest=dest,
-                                                          max_parallel_jobs=max_parallel_jobs,
-                                                          spawn_func=self._spawn_url_resolve)
+    result = self._execute_parallel_pip_requirement_command(dest=dest,
+                                                            max_parallel_jobs=max_parallel_jobs,
+                                                            spawn_func=self._spawn_url_resolve)
+    assert ((len(result) == 1) and isinstance(result[0], list)), f'the result of a url resolve must be a list of length 1 containing another list -- was: {result}'
+    return result[0]
 
-  def _execute_parallel_pip_requirement_command(self, dest, max_parallel_jobs, spawn_func)
+  def _execute_parallel_pip_requirement_command(self, dest, max_parallel_jobs, spawn_func):
     if not self.requirements and not self.requirement_files:
       # Nothing to resolve.
       return None
@@ -598,7 +601,6 @@ class BuildAndInstallRequest(object):
           to_install.extend(build_result.finalize_build())
 
     # 2. Install wheels in individual chroots.
-
     # Dedup by wheel name; e.g.: only install universal wheels once even though they'll get
     # downloaded / built for each interpreter or platform.
     install_requests_by_wheel_file = OrderedDict()
