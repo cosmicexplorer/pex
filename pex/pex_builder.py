@@ -339,13 +339,97 @@ class PEXBuilder(object):
     self._shebang = '#!%s' % shebang if not shebang.startswith('#!') else shebang
 
   def _add_dist_dir(self, path, dist_name):
-    for root, _, files in os.walk(path):
-      for f in files:
-        filename = os.path.join(root, f)
-        relpath = os.path.relpath(filename, path)
-        target = os.path.join(self._pex_info.internal_cache, dist_name, relpath)
-        self._copy_or_link(filename, target)
-    return CacheHelper.dir_hash(path)
+    # Record all the file paths (source and destination) that we plan to copy or link into the pex
+    # cache.
+    target_file_paths = []
+    # The list of files in the directory is cached so we don't have to compute it again when
+    # computing directory hashes.
+    memoized_file_paths = []
+    for relpath in CacheHelper._iter_files(path):
+      target = '{}/{}/{}'.format(self._pex_info.internal_cache,
+                                 dist_name,
+                                 relpath)
+      # target = os.path.join(self._pex_info.internal_cache, dist_name, relpath)
+      target_file_paths.append(target)
+      # self._copy_or_link(filename, target)
+      memoized_file_paths.append(relpath)
+
+    synthesized_command_lines = []
+    for src_relpath, dst_relpath in zip(memoized_file_paths, target_file_paths):
+      # NB: we add the path prefix manually to avoid making a filesystem call here with
+      # os.path.join.
+      src_abspath = '{}/{}'.format(path, src_relpath)
+      dst_abspath = '{}/{}'.format(self._chroot.path(), dst_relpath)
+      # In the bash script input, we define a safe_copy shell function which tries to mimic the
+      # logic of the python safe_copy() method. This command line will invoke that shell function.
+      hard_link_src_dst_args = [src_abspath, dst_abspath]
+      synthesized_command_lines.append(hard_link_src_dst_args)
+
+    # Hand off the mass hard-linking to a subprocess to avoid keeping the GIL.
+    import subprocess
+    hash_files_script = """\
+set -euo pipefail
+
+function find_relevant_files {
+    find . -not \\( -name '*.pyc' -or -name '.digest' \\) -type f
+}
+
+function get_all_output {
+    find_relevant_files \\
+        | sed -Ee 's#^\\./##g' \\
+        | sort \\
+        | tr -d '\\n'
+
+    find_relevant_files \\
+        | sort \\
+        | xargs cat
+}
+
+get_all_output | sha1sum | awk '{print $1}' | tr -d '\\n'
+"""
+    hash_files_subproc = subprocess.Popen(['/bin/bash', '-c', hash_files_script],
+                                          stdout=subprocess.PIPE,
+                                          cwd=path)
+
+    hard_links_source = """\
+set -euo pipefail
+
+function safe_copy {
+    source="$1"
+    dest="$2"
+    output_dir="$(dirname "$dest")"
+    mkdir -p "$output_dir"
+    if [[ ! -f "$dest" ]]; then
+        # TODO: consider ln -v, if that's immediately portable to gnu coreutils `ln`.
+        ln "$source" "$dest"
+    fi
+}
+
+function find_relevant_files {
+    find . -not \\( -name '*.pyc' -or -name '.digest' \\) -type f
+}
+
+find_relevant_files \\
+    | while read -r source; do
+        dest="${OUTPUT_DIR}/${source}"
+        safe_copy "$source" "$dest"
+    done
+"""
+    subprocess.check_call(['/bin/bash', '-c', hard_links_source],
+                          cwd=path,
+                          env={
+                            'OUTPUT_DIR': '{}/{}/{}'.format(self._chroot.path(),
+                                                            self._pex_info.internal_cache,
+                                                            dist_name)
+                          })
+
+    stdout, _ = hash_files_subproc.communicate()
+    hash_result = stdout.decode('utf-8')
+
+    for dst_relpath in target_file_paths:
+      self._chroot._tag(dst_relpath, label=None)
+
+    return hash_result
 
   def _add_dist_wheel_file(self, path, dist_name):
     with temporary_dir() as install_dir:

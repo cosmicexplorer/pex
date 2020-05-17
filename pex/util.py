@@ -108,9 +108,20 @@ class CacheHelper(object):
   @classmethod
   def _iter_files(cls, directory):
     normpath = os.path.realpath(os.path.normpath(directory))
-    for root, _, files in os.walk(normpath):
-      for f in files:
-        yield os.path.relpath(os.path.join(root, f), normpath)
+    assert os.path.isabs(normpath), normpath
+    import subprocess
+    files_in_dir = (subprocess
+                    .check_output([
+                      'find',
+                      normpath,
+                      '-not', '-name', '.digest',
+                      '-type', 'f'])
+                    .decode('utf-8')
+                    .splitlines())
+    for filename in files_in_dir:
+      # NB: Remove the prefix directory as well as the leading /!
+      relpath = filename[(len(normpath)+1):]
+      yield relpath
 
   @classmethod
   def pex_hash(cls, d):
@@ -121,12 +132,23 @@ class CacheHelper(object):
     return cls._compute_hash(names, stream_factory)
 
   @classmethod
-  def dir_hash(cls, d):
+  def dir_hash(cls, d, memoized_file_paths=None):
     """Return a reproducible hash of the contents of a directory."""
-    names = sorted(f for f in cls._iter_files(d) if not f.endswith('.pyc'))
-    def stream_factory(name):
-      return open(os.path.join(d, name), 'rb')  # noqa: T802
-    return cls._compute_hash(names, stream_factory)
+    memoized_hash_file = os.path.join(d, '.digest')
+    try:
+      with open(memoized_hash_file, 'wb') as memo_fp:
+        return memo_fp.read().decode('utf-8')
+    except OSError:
+      if memoized_file_paths is None:
+        names = sorted(f for f in cls._iter_files(d) if not f.endswith('.pyc'))
+      else:
+        names = memoized_file_paths
+      def stream_factory(name):
+        return open(os.path.join(d, name), 'rb')  # noqa: T802
+      hash_result = cls._compute_hash(names, stream_factory)
+      with open(memoized_hash_file, 'wb') as memo_fp:
+        memo_fp.write(hash_result.encode('utf-8'))
+      return hash_result
 
   @classmethod
   def cache_distribution(cls, zf, source, target_dir):
