@@ -20,7 +20,7 @@ from pex.interpreter import spawn_python_job
 from pex.jobs import SpawnedJob, execute_parallel
 from pex.orderedset import OrderedSet
 from pex.pex_info import PexInfo
-from pex.pip import get_pip
+from pex.pip import get_backup_pip, get_pip
 from pex.platforms import Platform
 from pex.requirements import local_project_from_requirement, local_projects_from_requirement_file
 from pex.third_party.packaging.markers import Marker
@@ -256,7 +256,7 @@ class DownloadRequest(namedtuple('DownloadRequest', [
 
   def _spawn_download(self, resolved_dists_dir, target):
     download_dir = os.path.join(resolved_dists_dir, target.id)
-    download_job = get_pip().spawn_download_distributions(
+    download_job = get_backup_pip().spawn_download_distributions(
       download_dir=download_dir,
       requirements=self.requirements,
       requirement_files=self.requirement_files,
@@ -536,7 +536,7 @@ class BuildAndInstallRequest(object):
 
   def _spawn_wheel_build(self, built_wheels_dir, build_request):
     build_result = build_request.result(built_wheels_dir)
-    build_job = get_pip().spawn_build_wheels(
+    build_job = get_backup_pip().spawn_build_wheels(
       distributions=[build_request.source_path],
       wheel_dir=build_result.build_dir,
       cache=self._cache,
@@ -564,7 +564,7 @@ class BuildAndInstallRequest(object):
 
   def _spawn_install(self, installed_wheels_dir, install_request):
     install_result = install_request.result(installed_wheels_dir)
-    install_job = get_pip().spawn_install_wheel(
+    install_job = get_backup_pip().spawn_install_wheel(
       wheel=install_request.wheel_path,
       install_dir=install_result.build_chroot,
       compile=self._compile,

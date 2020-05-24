@@ -22,6 +22,25 @@ from pex.variables import ENV
 
 class Pip(object):
   @classmethod
+  def create_backup_pip(cls, path):
+    pip_pex_path = os.path.join(path, isolated().pex_hash)
+    with atomic_directory(pip_pex_path) as chroot:
+      if chroot is not None:
+        from pex.pex_builder import PEXBuilder
+        from pex.resolver import resolve
+
+        isolated_pip_builder = PEXBuilder(path=chroot)
+        for installed_dist in resolve(['pip']):
+          dist = installed_dist.distribution
+          isolated_pip_builder.add_distribution(dist)
+          isolated_pip_builder.add_requirement(dist.as_requirement())
+
+        isolated_pip_builder.set_entry_point('pip')
+        isolated_pip_builder.freeze()
+
+    return cls(pip_pex_path)
+
+  @classmethod
   def create(cls, path):
     """Creates a pip tool with PEX isolation at path.
 
@@ -366,3 +385,13 @@ def get_pip():
   if _PIP is None:
     _PIP = Pip.create(path=os.path.join(ENV.PEX_ROOT, 'pip.pex'))
   return _PIP
+
+
+_BACKUP_PIP = None
+
+
+def get_backup_pip():
+  global _BACKUP_PIP
+  if _BACKUP_PIP is None:
+    _BACKUP_PIP = Pip.create_backup_pip(path=os.path.join(ENV.PEX_ROOT, 'backup-pip.pex'))
+  return _BACKUP_PIP
