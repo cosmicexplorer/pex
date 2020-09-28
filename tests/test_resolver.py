@@ -367,6 +367,28 @@ def test_issues_851():
     assert "contextlib2" in resolved_project_to_version
 
 
+def test_deduplicates_exact_platform_matching_interpreter():
+    # type: () -> None
+    # After https://github.com/pantsbuild/pex/1000, --platform is able to use the current
+    # interpreter to build sdists, if the current interpreter's `.supported_platforms` match that
+    # platform. However, if the --platform provided *exactly* matches the interpreter's `.platform`,
+    # the exact same wheels would have been downloaded twice. This can occur when
+    # --resolve-local-platforms is used.
+    python36 = ensure_python_interpreter(PY36)
+    interpreter36 = PythonInterpreter.from_binary(python36)
+
+    with temporary_dir() as td:
+        # N.B.: We use psutil since only an sdist is available for linux and osx and the
+        # distribution has no dependencies.
+        dists = download(
+            ['psutil==5.7.0'],
+            dest=td,
+            platforms=[interpreter36.platform],
+            interpreters=[interpreter36],
+        )
+        assert len(dists) == 1
+
+
 def test_issues_892():
     # type: () -> None
     python27 = ensure_python_interpreter(PY27)
