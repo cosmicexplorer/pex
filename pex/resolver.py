@@ -966,13 +966,29 @@ def _download_internal(
                 # Build for the specified local interpreters (on the current platform).
                 yield DistributionTarget.for_interpreter(interpreter)
 
+        def check_platform_against_interpreters(platform):
+            if platform is not None:
+                # 1. Build for specific platforms, if not already matched by some interpreter.
+                if interpreters:
+                    for interpreter in interpreters:
+                        # NB: `interpreter.platform` will be used to resolve against. If the
+                        # `platform` is not exactly the same, we *want* to download for both
+                        # platforms, even if they may often return multiple identical dists.
+                        if platform == interpreter.platform:
+                            break
+                    else:
+                        yield DistributionTarget.for_platform(platform)
+                else:
+                    yield DistributionTarget.for_platform(platform)
+            elif not interpreters:
+                # 2. Build for the current platform (None) only if not done already (ie: no
+                #    interpreters were specified).
+                yield DistributionTarget.for_platform(platform)
+
         if parsed_platforms:
             for platform in parsed_platforms:
-                if platform is not None or not interpreters:
-                    # 1. Build for specific platforms.
-                    # 2. Build for the current platform (None) only if not done already (ie: no intepreters
-                    #    were specified).
-                    yield DistributionTarget.for_platform(platform)
+                for target in check_platform_against_interpreters(platform):
+                    yield target
 
     # Only download for each target once. The download code assumes this unique targets optimization
     # when spawning parallel downloads.

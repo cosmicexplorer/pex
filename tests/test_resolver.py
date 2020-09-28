@@ -372,8 +372,7 @@ def test_deduplicates_exact_platform_matching_interpreter():
     # After https://github.com/pantsbuild/pex/1000, --platform is able to use the current
     # interpreter to build sdists, if the current interpreter's `.supported_platforms` match that
     # platform. However, if the --platform provided *exactly* matches the interpreter's `.platform`,
-    # the exact same wheels would have been downloaded twice. This can occur when
-    # --resolve-local-platforms is used.
+    # the exact same wheels would have been downloaded twice.
     python36 = ensure_python_interpreter(PY36)
     interpreter36 = PythonInterpreter.from_binary(python36)
 
