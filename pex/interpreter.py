@@ -607,7 +607,7 @@ class PythonInterpreter(object):
 
         :rtype: :class:`Platform`
         """
-        return next(self._identity.iter_supported_platforms())
+        return next(iter(self.supported_platforms))
 
     @property
     def supported_platforms(self):
@@ -618,6 +618,25 @@ class PythonInterpreter(object):
         if self._supported_platforms is None:
             self._supported_platforms = frozenset(self._identity.iter_supported_platforms())
         return self._supported_platforms
+
+    def _copy(self):
+        return PythonInterpreter(self._identity)
+
+    def restrict_to_platforms(self, platforms):
+        """Return a copy of this interpreter restricted to a subset of its supported platforms.
+
+        :param platforms: The platforms to restrict the interpreter to.
+        :type platforms: iterable of str
+        :rtype: :class:`PythonInterpreter`.
+        :raises ValueError: If `platforms` is not a subset of the interpreter's supported platforms.
+        """
+        platforms_set = frozenset(platforms)
+        if not platforms_set.issubset(self.supported_platforms):
+            raise ValueError("Platforms {} were not a subset of the interpreter {}'s platforms {}"
+                             .format(platforms_set, self, self.supported_platforms))
+        clone = self._copy()
+        clone._supported_platforms = platforms_set
+        return clone
 
     def execute(self, args=None, stdin_payload=None, pythonpath=None, env=None, **kwargs):
         return self._execute(

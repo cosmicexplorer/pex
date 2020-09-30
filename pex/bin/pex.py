@@ -24,7 +24,7 @@ from pex.jobs import DEFAULT_MAX_JOBS
 from pex.network_configuration import NetworkConfiguration
 from pex.orderedset import OrderedSet
 from pex.pex import PEX
-from pex.pex_bootstrapper import iter_compatible_interpreters
+from pex.pex_bootstrapper import align_platforms_and_interpreters, iter_compatible_interpreters
 from pex.pex_builder import PEXBuilder
 from pex.platforms import Platform
 from pex.resolver import Unsatisfiable, parsed_platform, resolve_multi
@@ -757,33 +757,17 @@ def build_pex(reqs, options, cache=None):
 
     platforms = OrderedSet(options.platforms)
     interpreters = interpreters or []
-    if options.platforms and options.resolve_local_platforms:
+    if platforms:
         with TRACER.timed(
             "Searching for local interpreters matching {}".format(", ".join(map(str, platforms)))
         ):
-            candidate_interpreters = OrderedSet(iter_compatible_interpreters(pex_python_path))
-            candidate_interpreters.add(PythonInterpreter.get())
-            for candidate_interpreter in candidate_interpreters:
-                resolved_platforms = candidate_interpreter.supported_platforms.intersection(
-                    platforms
-                )
-                if resolved_platforms:
-                    for resolved_platform in resolved_platforms:
-                        TRACER.log(
-                            "Resolved {} for platform {}".format(
-                                candidate_interpreter, resolved_platform
-                            )
-                        )
-                        platforms.remove(resolved_platform)
-                    interpreters.append(candidate_interpreter)
-        if platforms:
-            TRACER.log(
-                "Could not resolve a local interpreter for {}, will resolve only binary distributions "
-                "for {}.".format(
-                    ", ".join(map(str, platforms)),
-                    "this platform" if len(platforms) == 1 else "these platforms",
-                )
+            remaining_platforms, matching_interpreters, unmatched_interpreters = (
+                align_platforms_and_interpreters(interpreters, platforms)
             )
+            interpreters = []
+            interpreters.extend(matching_interpreters)
+            interpreters.extend(unmatched_interpreters)
+            platforms = remaining_platforms
 
     interpreter = min(interpreters) if interpreters else None
     if options.use_first_matching_interpreter and interpreters:

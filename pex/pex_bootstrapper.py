@@ -89,6 +89,57 @@ def iter_compatible_interpreters(path=None, compatibility_constraints=None):
     )
 
 
+def align_platforms_and_interpreters(candidate_interpreters, candidate_platforms):
+    """Match up as many candidate platforms as possible with a copy of a candidate interpreter which
+    supports that platform.
+
+    Return a tuple of:
+    - unmatched candidate platforms,
+    - copies of candidate interpreters restricted to some matched candidate platform,
+    - unmatched candidate interpreters.
+
+    :param candidate_interpreters: The interpreters to match against platforms.
+    :type candidate_interpreters: iterable of :class:`PythonInterpreter`
+    :param candidate_platforms: The platforms to match up with interpreters if possible.
+    :type candidate_platforms: iterable of :class:`Platform`, or None.
+    :rtype: (OrderedSet of :class:`Platform`, list of :class:`PythonInterpreter`, list of :class:`PythonInterpreter`).
+    """
+    remaining_platforms = OrderedSet(candidate_platforms)
+    matching_interpreters = []
+    unmatched_interpreters = []
+
+    for candidate_interpreter in candidate_interpreters:
+        resolved_platforms = candidate_interpreter.supported_platforms.intersection(
+            remaining_platforms
+        )
+        if resolved_platforms:
+            for resolved_platform in resolved_platforms:
+                TRACER.log(
+                    "Resolved {} for platform {}".format(
+                        candidate_interpreter, resolved_platform
+                    )
+                )
+                # Ensure that none of the requested platforms are lost by making a copy of
+                # the matching interpreter for each --platform argument given.
+                matching_interpreters.append(candidate_interpreter.restrict_to_platforms(
+                    [resolved_platform],
+                ))
+                remaining_platforms.remove(resolved_platform)
+        else:
+            unmatched_interpreters.append(candidate_interpreter)
+
+    if remaining_platforms:
+        TRACER.log(
+            "Could not resolve a local interpreter for {}, will resolve only binary distributions "
+            "for {}.".format(
+                ", ".join(map(str, remaining_platforms)),
+                "this platform" if len(remaining_platforms) == 1 else "these platforms",
+            )
+        )
+
+    return (remaining_platforms, matching_interpreters, unmatched_interpreters)
+
+
 def _matched_interpreters_iter(interpreters_iter, constraints):
     candidates = []
     failures = []

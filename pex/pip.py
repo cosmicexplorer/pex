@@ -199,6 +199,7 @@ class Pip(object):
         target = target or DistributionTarget.current()
 
         platform = target.get_platform()
+        raise Exception(f'plat: {platform}')
         if not use_wheel:
             if not build:
                 raise ValueError(

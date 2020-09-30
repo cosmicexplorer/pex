@@ -5,6 +5,7 @@
 from __future__ import absolute_import
 
 import functools
+import itertools
 import json
 import os
 import subprocess
@@ -18,6 +19,7 @@ from pex.distribution_target import DistributionTarget
 from pex.interpreter import spawn_python_job
 from pex.jobs import Raise, SpawnedJob, execute_parallel
 from pex.orderedset import OrderedSet
+from pex.pex_bootstrapper import align_platforms_and_interpreters
 from pex.pex_info import PexInfo
 from pex.pip import get_pip
 from pex.platforms import Platform
@@ -64,8 +66,8 @@ class DistributionRequirements(object):
                 import sys
                 from collections import defaultdict
                 from pkg_resources import Environment
-        
-        
+
+
                 env = Environment(search_path={search_path!r})
                 dependency_requirements = []
                 for key in env:
@@ -954,41 +956,32 @@ def _download_internal(
 ):
 
     parsed_platforms = [parsed_platform(platform) for platform in platforms] if platforms else []
+    interpreters = interpreters if interpreters else []
 
     def iter_targets():
         if not interpreters and not parsed_platforms:
-            # No specified targets, so just build for the current interpreter (on the current platform).
+            # No specified targets, so just build for the current interpreter (on the most general
+            # platform it supports).
             yield DistributionTarget.current()
             return
 
-        if interpreters:
-            for interpreter in interpreters:
-                # Build for the specified local interpreters (on the current platform).
-                yield DistributionTarget.for_interpreter(interpreter)
+        remaining_platforms, matching_interpreters, unmatched_interpreters = (
+            align_platforms_and_interpreters(interpreters, parsed_platforms)
+        )
+        all_interpreters = list(itertools.chain(matching_interpreters, unmatched_interpreters))
 
-        def check_platform_against_interpreters(platform):
+        for interpreter in all_interpreters:
+            # Build for the specified local interpreters (possibly with restricted platforms).
+            yield DistributionTarget.for_interpreter(interpreter)
+
+        for platform in remaining_platforms:
             if platform is not None:
                 # 1. Build for specific platforms, if not already matched by some interpreter.
-                if interpreters:
-                    for interpreter in interpreters:
-                        # NB: `interpreter.platform` will be used to resolve against. If the
-                        # `platform` is not exactly the same, we *want* to download for both
-                        # platforms, even if they may often return multiple identical dists.
-                        if platform == interpreter.platform:
-                            break
-                    else:
-                        yield DistributionTarget.for_platform(platform)
-                else:
-                    yield DistributionTarget.for_platform(platform)
-            elif not interpreters:
+                yield DistributionTarget.for_platform(platform)
+            elif not all_interpreters:
                 # 2. Build for the current platform (None) only if not done already (ie: no
                 #    interpreters were specified).
                 yield DistributionTarget.for_platform(platform)
-
-        if parsed_platforms:
-            for platform in parsed_platforms:
-                for target in check_platform_against_interpreters(platform):
-                    yield target
 
     # Only download for each target once. The download code assumes this unique targets optimization
     # when spawning parallel downloads.
