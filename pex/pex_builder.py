@@ -435,7 +435,7 @@ class PEXBuilder(object):
 
     def _add_dist_dir(self, path, dist_name, fingerprint=None):
         target_dir = os.path.join(self._pex_info.internal_cache, dist_name)
-        if self._copy_mode == CopyMode.SYMLINK:
+        if self._copy_mode in [CopyMode.SYMLINK, CopyMode.LINK]:
             self._copy_or_link(path, target_dir, label=dist_name)
         else:
             for root, _, files in os.walk(path):
