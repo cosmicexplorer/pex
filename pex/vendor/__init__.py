@@ -194,20 +194,17 @@ def iter_vendor_specs(filter_requires_python=False):
 
     # We shell out to pip at buildtime to resolve and install dependencies.
     # N.B.: We're currently using a patched version of Pip 20.3.4 housed at
-    # https://github.com/pantsbuild/pip/tree/pex/patches/generation-2.
-    # It has 2 patches:
+    # https://github.com/cosmicexplorer/pip/tree/bump-pip-version.
+    # It has 1 patch:
     # 1.) https://github.com/pantsbuild/pip/commit/06f462537c981116c763c1ba40cf40e9dd461bcf
     #     The patch works around a bug in `pip download --constraint...` tracked at
     #     https://github.com/pypa/pip/issues/9283 and fixed by https://github.com/pypa/pip/pull/9301
     #     there and https://github.com/pantsbuild/pip/pull/8 in our fork.
-    # 2.) https://github.com/pantsbuild/pip/commit/386a54f097ece66775d0c7f34fd29bb596c6b0be
-    #     This is a cherry-pick of
-    #     https://github.com/pantsbuild/pip/commit/00fb5a0b224cde08e3e5ca034247baadfb646468
-    #     (https://github.com/pypa/pip/pull/9533) from upstream that upgrades Pip's vendored
-    #     packaging to 20.9 to pick up support for mac universal2 wheels.
+    # 2.) [obsolete] upgrades Pip's vendored packaging to 20.9 to pick up support for mac
+    #     universal2 wheels.
     yield VendorSpec.git(
-        repo="https://github.com/pantsbuild/pip",
-        commit="386a54f097ece66775d0c7f34fd29bb596c6b0be",
+        repo="https://github.com/cosmicexplorer/pip",
+        commit="a3d7f406f3edc094fe1bc2f6d18205030aa007af",
         project_name="pip",
         rewrite=False,
     )
