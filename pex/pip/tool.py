@@ -390,9 +390,14 @@ class Pip(object):
         )
         return Job(command=command, process=process, finalizer=finalizer)
 
-    def spawn_download_distributions(
+    def spawn_download_distributions(self, download_dir, *args,**kwargs):
+        # type: (str, Any, Any) -> Job
+        download_cmd = ["download", "--dest", download_dir]
+        return self.spawn_resolve_distributions(download_cmd, *args, **kwargs)
+
+    def spawn_resolve_distributions(
         self,
-        download_dir,  # type: str
+        args,                             # type: Iterable[str]
         requirements=None,  # type: Optional[Iterable[str]]
         requirement_files=None,  # type: Optional[Iterable[str]]
         constraint_files=None,  # type: Optional[Iterable[str]]
@@ -423,41 +428,41 @@ class Pip(object):
                     "{}".format(target.platform)
                 )
 
-        download_cmd = ["download", "--dest", download_dir]
+        resolve_cmd = list(args)
         extra_env = {}  # type: Dict[str, str]
 
         if not build:
-            download_cmd.extend(["--only-binary", ":all:"])
+            resolve_cmd.extend(["--only-binary", ":all:"])
 
         if not use_wheel:
-            download_cmd.extend(["--no-binary", ":all:"])
+            resolve_cmd.extend(["--no-binary", ":all:"])
 
         if prefer_older_binary:
-            download_cmd.append("--prefer-binary")
+            resolve_cmd.append("--prefer-binary")
 
         if use_pep517 is not None:
-            download_cmd.append("--use-pep517" if use_pep517 else "--no-use-pep517")
+            resolve_cmd.append("--use-pep517" if use_pep517 else "--no-use-pep517")
 
         if not build_isolation:
-            download_cmd.append("--no-build-isolation")
+            resolve_cmd.append("--no-build-isolation")
             extra_env.update(PEP517_BACKEND_PATH=os.pathsep.join(sys.path))
 
         if allow_prereleases:
-            download_cmd.append("--pre")
+            resolve_cmd.append("--pre")
 
         if not transitive:
-            download_cmd.append("--no-deps")
+            resolve_cmd.append("--no-deps")
 
         if requirement_files:
             for requirement_file in requirement_files:
-                download_cmd.extend(["--requirement", requirement_file])
+                resolve_cmd.extend(["--requirement", requirement_file])
 
         if constraint_files:
             for constraint_file in constraint_files:
-                download_cmd.extend(["--constraint", constraint_file])
+                resolve_cmd.extend(["--constraint", constraint_file])
 
         if requirements:
-            download_cmd.extend(requirements)
+            resolve_cmd.extend(requirements)
 
         foreign_platform_observer = foreign_platform.patch(target)
         if (
@@ -511,7 +516,7 @@ class Pip(object):
                     V=ENV.PEX_VERBOSE,
                 )
 
-            download_cmd = ["--log", log] + download_cmd
+            resolve_cmd = ["--log", log] + resolve_cmd
             # N.B.: The `pip -q download ...` command is quiet but
             # `pip -q --log log.txt download ...` leaks download progress bars to stdout. We work
             # around this by sending stdout to the bit bucket.
@@ -543,13 +548,16 @@ class Pip(object):
 
         elif preserve_log:
             TRACER.log(
-                "The `pip download` log is not being utilized, to see more `pip download` "
-                "details, re-run with more Pex verbosity (more `-v`s).",
+                "The `pip {}` log is not being utilized, to see more `pip download` "
+                "details, re-run with more Pex verbosity (more `-v`s).".format(' '.join(
+                    shlex_quote(arg)
+                    for arg in resolve_cmd
+                )),
                 V=ENV.PEX_VERBOSE,
             )
 
         command, process = self._spawn_pip_isolated(
-            download_cmd,
+            resolve_cmd,
             package_index_configuration=package_index_configuration,
             interpreter=target.get_interpreter(),
             pip_verbosity=0,
