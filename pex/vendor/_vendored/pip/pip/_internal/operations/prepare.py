@@ -7,12 +7,11 @@
 import mimetypes
 import os
 import shutil
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Set
 
 from pip._vendor.packaging.utils import canonicalize_name
 
 from pip._internal.distributions import make_distribution_for_install_requirement
-from pip._internal.distributions.installed import InstalledDistribution
 from pip._internal.exceptions import (
     DirectoryUrlHashUnsupported,
     HashMismatch,
@@ -24,7 +23,10 @@ from pip._internal.exceptions import (
     VcsHashUnsupported,
 )
 from pip._internal.index.package_finder import PackageFinder
-from pip._internal.metadata import BaseDistribution, get_metadata_distribution
+from pip._internal.metadata import (
+    BaseDistribution,
+    get_metadata_distribution,
+)
 from pip._internal.models.direct_url import ArchiveInfo
 from pip._internal.models.link import Link
 from pip._internal.models.wheel import Wheel
@@ -65,10 +67,12 @@ def _get_prepared_distribution(
 ) -> BaseDistribution:
     """Prepare a distribution for installation."""
     abstract_dist = make_distribution_for_install_requirement(req)
-    with build_tracker.track(req):
-        abstract_dist.prepare_distribution_metadata(
-            finder, build_isolation, check_build_deps
-        )
+    tracker_id = abstract_dist.build_tracker_id
+    if tracker_id is not None:
+        with build_tracker.track(req, tracker_id):
+            abstract_dist.prepare_distribution_metadata(
+                finder, build_isolation, check_build_deps
+            )
     return abstract_dist.get_metadata_distribution()
 
 
@@ -186,6 +190,8 @@ def _check_download_dir(
 ) -> Optional[str]:
     """Check download_dir for previously downloaded file with correct hash
     If a correct file is found return its path else None
+
+    If a file is found at the given path, but with an invalid hash, the file is deleted.
     """
     download_path = os.path.join(download_dir, link.filename)
 
@@ -374,6 +380,9 @@ class RequirementPreparer:
                 "Metadata-only fetching is not used in the legacy resolver",
             )
             return None
+        # TODO: this should probably not be checked here, but rather later once we
+        # download the wheels? Otherwise hash checking won't be able to use
+        # metadata-only dists at all.
         if self.require_hashes:
             logger.debug(
                 "Metadata-only fetching is not used as hash checking is required",
@@ -472,6 +481,8 @@ class RequirementPreparer:
             assert req.link
             links_to_fully_download[req.link] = req
 
+        reqs_with_newly_unpacked_source_dirs: Set[Link] = set()
+
         batch_download = self._batch_download(
             links_to_fully_download.keys(),
             temp_dir,
@@ -479,25 +490,36 @@ class RequirementPreparer:
         for link, (filepath, _) in batch_download:
             logger.debug("Downloading link %s to %s", link, filepath)
             req = links_to_fully_download[link]
+            # Record the downloaded file path so wheel reqs can extract a Distribution
+            # in .get_dist().
             req.local_file_path = filepath
-            # TODO: This needs fixing for sdists
-            # This is an emergency fix for #11847, which reports that
-            # distributions get downloaded twice when metadata is loaded
-            # from a PEP 658 standalone metadata file. Setting _downloaded
-            # fixes this for wheels, but breaks the sdist case (tests
-            # test_download_metadata). As PyPI is currently only serving
-            # metadata for wheels, this is not an immediate issue.
-            # Fixing the problem properly looks like it will require a
-            # complete refactoring of the `prepare_linked_requirements_more`
-            # logic, and I haven't a clue where to start on that, so for now
-            # I have fixed the issue *just* for wheels.
-            if req.is_wheel:
-                self._downloaded[req.link.url] = filepath
+            # Record that the file is downloaded so we don't do it again in
+            # _prepare_linked_requirement().
+            self._downloaded[req.link.url] = filepath
+
+            # If this is an sdist, we need to unpack it and set the .source_dir
+            # immediately after downloading, as _prepare_linked_requirement() assumes
+            # the req is either not downloaded at all, or both downloaded and
+            # unpacked. The downloading and unpacking is is typically done with
+            # unpack_url(), but we separate the downloading and unpacking steps here in
+            # order to use the BatchDownloader.
+            if not req.is_wheel:
+                hashes = self._get_linked_req_hashes(req)
+                assert filepath == _check_download_dir(req.link, temp_dir, hashes)
+                self._ensure_link_req_src_dir(req, parallel_builds)
+                unpack_file(filepath, req.source_dir)
+                reqs_with_newly_unpacked_source_dirs.add(req.link)
 
         # This step is necessary to ensure all lazy wheels are processed
         # successfully by the 'download', 'wheel', and 'install' commands.
         for req in partially_downloaded_reqs:
-            self._prepare_linked_requirement(req, parallel_builds)
+            self._prepare_linked_requirement(
+                req,
+                parallel_builds,
+                source_dir_exists_already=(
+                    req.link in reqs_with_newly_unpacked_source_dirs
+                ),
+            )
 
     def prepare_linked_requirement(
         self, req: InstallRequirement, parallel_builds: bool = False
@@ -531,44 +553,98 @@ class RequirementPreparer:
                 # The file is not available, attempt to fetch only metadata
                 metadata_dist = self._fetch_metadata_only(req)
                 if metadata_dist is not None:
-                    req.needs_more_preparation = True
+                    # These reqs now have the dependency information from the downloaded
+                    # metadata, without having downloaded the actual dist at all.
+                    req.cache_virtual_metadata_only_dist(metadata_dist)
                     return metadata_dist
 
             # None of the optimizations worked, fully prepare the requirement
             return self._prepare_linked_requirement(req, parallel_builds)
 
-    def prepare_linked_requirements_more(
-        self, reqs: Iterable[InstallRequirement], parallel_builds: bool = False
-    ) -> None:
-        """Prepare linked requirements more, if needed."""
-        reqs = [req for req in reqs if req.needs_more_preparation]
+    def _ensure_download_info(self, reqs: Iterable[InstallRequirement]) -> None:
+        """
+        `pip install --report` extracts the download info from each requirement for its
+        JSON output, so we need to make sure every requirement has this before finishing
+        the resolve. But .download_info will only be populated by the point this method
+        is called for requirements already found in the wheel cache, so we need to
+        synthesize it for uncached results. Luckily, a DirectUrl can be parsed directly
+        from a url without any other context. However, this also means the download info
+        will only contain a hash if the link itself declares the hash.
+        """
         for req in reqs:
+            self._populate_download_info(req)
+
+    def _force_fully_prepared(
+        self, reqs: Iterable[InstallRequirement], require_concrete: bool
+    ) -> None:
+        """
+        The legacy resolver seems to prepare requirements differently that can leave
+        them half-done in certain code paths. I'm not quite sure how it's doing things,
+        but at least we can do this to make sure they do things right.
+        """
+        for req in reqs:
+            req.prepared = True
+            if require_concrete:
+                assert req.is_concrete
+
+    def finalize_linked_requirements(
+        self,
+        reqs: Iterable[InstallRequirement],
+        hydrate_virtual_reqs: bool,
+        parallel_builds: bool = False,
+    ) -> None:
+        """Prepare linked requirements more, if needed.
+
+        Neighboring .metadata files as per PEP 658 or lazy wheels via fast-deps will be
+        preferred to extract metadata from any concrete requirement (one that has been
+        mapped to a Link) without downloading the underlying wheel or sdist. When ``pip
+        install --dry-run`` is called, we want to avoid ever downloading the underlying
+        dist, but we still need to provide all of the results that pip commands expect
+        from the typical resolve process.
+
+        Those expectations vary, but one distinction lies in whether the command needs
+        an actual physical dist somewhere on the filesystem, or just the metadata about
+        it from the resolver (as in ``pip install --report``). If the command requires
+        actual physical filesystem locations for the resolved dists, it must call this
+        method with ``hydrate_virtual_reqs=True`` to fully download anything
+        that remains.
+        """
+        if not hydrate_virtual_reqs:
+            self._ensure_download_info(reqs)
+            self._force_fully_prepared(reqs, require_concrete=False)
+            return
+
+        partially_downloaded_reqs: List[InstallRequirement] = []
+        for req in reqs:
+            if req.is_concrete:
+                continue
             # Determine if any of these requirements were already downloaded.
             if self.download_dir is not None and req.link.is_wheel:
                 hashes = self._get_linked_req_hashes(req)
-                file_path = _check_download_dir(req.link, self.download_dir, hashes)
+                # If the file is there, but doesn't match the hash, delete it and print
+                # a warning. We will be downloading it again via
+                # partially_downloaded_reqs.
+                file_path = _check_download_dir(
+                    req.link, self.download_dir, hashes, warn_on_hash_mismatch=True
+                )
                 if file_path is not None:
+                    # If the hash does match, then we still need to generate a concrete
+                    # dist, but we don't have to download the wheel again.
                     self._downloaded[req.link.url] = file_path
-                    req.needs_more_preparation = False
+            partially_downloaded_reqs.append(req)
 
-        # Prepare requirements we found were already downloaded for some
-        # reason. The other downloads will be completed separately.
-        partially_downloaded_reqs: List[InstallRequirement] = []
-        for req in reqs:
-            if req.needs_more_preparation:
-                partially_downloaded_reqs.append(req)
-            else:
-                self._prepare_linked_requirement(req, parallel_builds)
-
-        # TODO: separate this part out from RequirementPreparer when the v1
-        # resolver can be removed!
         self._complete_partial_requirements(
             partially_downloaded_reqs,
             parallel_builds=parallel_builds,
         )
+        # NB: Must call this method before returning!
+        self._force_fully_prepared(reqs, require_concrete=True)
 
     def _prepare_linked_requirement(
-        self, req: InstallRequirement, parallel_builds: bool
+        self,
+        req: InstallRequirement,
+        parallel_builds: bool,
+        source_dir_exists_already: bool = False,
     ) -> BaseDistribution:
         assert req.link
         link = req.link
@@ -600,7 +676,8 @@ class RequirementPreparer:
                 req.link = req.cached_wheel_source_link
                 link = req.link
 
-        self._ensure_link_req_src_dir(req, parallel_builds)
+        if not source_dir_exists_already:
+            self._ensure_link_req_src_dir(req, parallel_builds)
 
         if link.is_existing_dir():
             local_file = None
@@ -625,30 +702,12 @@ class RequirementPreparer:
                 hashes.check_against_path(file_path)
             local_file = File(file_path, content_type=None)
 
-        # If download_info is set, we got it from the wheel cache.
-        if req.download_info is None:
-            # Editables don't go through this function (see
-            # prepare_editable_requirement).
-            assert not req.editable
-            req.download_info = direct_url_from_link(link, req.source_dir)
-            # Make sure we have a hash in download_info. If we got it as part of the
-            # URL, it will have been verified and we can rely on it. Otherwise we
-            # compute it from the downloaded file.
-            # FIXME: https://github.com/pypa/pip/issues/11943
-            if (
-                isinstance(req.download_info.info, ArchiveInfo)
-                and not req.download_info.info.hashes
-                and local_file
-            ):
-                hash = hash_file(local_file.path)[0].hexdigest()
-                # We populate info.hash for backward compatibility.
-                # This will automatically populate info.hashes.
-                req.download_info.info.hash = f"sha256={hash}"
-
         # For use in later processing,
         # preserve the file path on the requirement.
         if local_file:
             req.local_file_path = local_file.path
+
+        self._populate_download_info(req)
 
         dist = _get_prepared_distribution(
             req,
@@ -659,9 +718,31 @@ class RequirementPreparer:
         )
         return dist
 
+    def _populate_download_info(self, req: InstallRequirement) -> None:
+        # If download_info is set, we got it from the wheel cache.
+        if req.download_info is None:
+            # Editables don't go through this function (see
+            # prepare_editable_requirement).
+            assert not req.editable
+            req.download_info = direct_url_from_link(req.link, req.source_dir)
+            # Make sure we have a hash in download_info. If we got it as part of the
+            # URL, it will have been verified and we can rely on it. Otherwise we
+            # compute it from the downloaded file.
+            # FIXME: https://github.com/pypa/pip/issues/11943
+            if (
+                isinstance(req.download_info.info, ArchiveInfo)
+                and not req.download_info.info.hashes
+                and req.local_file_path
+            ):
+                hash = hash_file(req.local_file_path)[0].hexdigest()
+                # We populate info.hash for backward compatibility.
+                # This will automatically populate info.hashes.
+                req.download_info.info.hash = f"sha256={hash}"
+
     def save_linked_requirement(self, req: InstallRequirement) -> None:
         assert self.download_dir is not None
         assert req.link is not None
+        assert req.is_concrete
         link = req.link
         if link.is_vcs or (link.is_existing_dir() and req.editable):
             # Make a .zip of the source_dir we already created.
@@ -716,6 +797,8 @@ class RequirementPreparer:
 
             req.check_if_exists(self.use_user_site)
 
+        # This should already have been populated by the preparation of the source dist.
+        assert req.is_concrete
         return dist
 
     def prepare_installed_requirement(
@@ -740,4 +823,13 @@ class RequirementPreparer:
                     "completely repeatable environment, install into an "
                     "empty virtualenv."
                 )
-            return InstalledDistribution(req).get_metadata_distribution()
+            dist = _get_prepared_distribution(
+                req,
+                self.build_tracker,
+                self.finder,
+                self.build_isolation,
+                self.check_build_deps,
+            )
+
+        assert req.is_concrete
+        return dist

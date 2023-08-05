@@ -84,7 +84,8 @@ class InstallCommand(RequirementCommand):
             help=(
                 "Don't actually install anything, just print what would be. "
                 "Can be used in combination with --ignore-installed "
-                "to 'resolve' the requirements."
+                "to 'resolve' the requirements. If PEP 658 or fast-deps metadata is "
+                "available, --dry-run also avoids downloading the dependency at all."
             ),
         )
         self.cmd_opts.add_option(
@@ -376,6 +377,10 @@ class InstallCommand(RequirementCommand):
 
             requirement_set = resolver.resolve(
                 reqs, check_supported_wheels=not options.target_dir
+            )
+            preparer.finalize_linked_requirements(
+                requirement_set.requirements.values(),
+                hydrate_virtual_reqs=not options.dry_run,
             )
 
             if options.json_report_file:
