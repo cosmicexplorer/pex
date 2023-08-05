@@ -139,7 +139,7 @@ class PackageIndexConfiguration(object):
         find_links=None,  # type: Optional[Iterable[str]]
         network_configuration=None,  # type: Optional[NetworkConfiguration]
         password_entries=(),  # type: Iterable[PasswordEntry]
-        fast_deps=False,      # type: bool
+        fast_deps=False,  # type: bool
     ):
         # type: (...) -> PackageIndexConfiguration
         resolver_version = resolver_version or ResolverVersion.default(pip_version)
@@ -172,7 +172,7 @@ class PackageIndexConfiguration(object):
         isolated,  # type: bool
         password_entries=(),  # type: Iterable[PasswordEntry]
         pip_version=None,  # type: Optional[PipVersionValue]
-        fast_deps=False,   # type: bool
+        fast_deps=False,  # type: bool
     ):
         # type: (...) -> None
         self.resolver_version = resolver_version  # type: ResolverVersion.Value
@@ -403,14 +403,22 @@ class Pip(object):
         )
         return Job(command=command, process=process, finalizer=finalizer)
 
-    def spawn_download_distributions(self, download_dir, *args,**kwargs):
+    def spawn_download_distributions(self, download_dir, *args, **kwargs):
         # type: (str, Any, Any) -> Job
         download_cmd = ["download", "--dest", download_dir]
         return self.spawn_resolve_distributions(download_cmd, *args, **kwargs)
 
+    def spawn_metadata_only_resolve_distributions(self, report_path, *args, **kwargs):
+        # type: (str, Any, Any) -> Job
+        resolve_cmd = [
+            "install", "--report", report_path, "--ignore-installed", "--dry-run",
+            "--use-feature=fast-deps",
+        ]
+        return self.spawn_resolve_distributions(resolve_cmd, *args, **kwargs)
+
     def spawn_resolve_distributions(
         self,
-        args,                             # type: Iterable[str]
+        args,  # type: Iterable[str]
         requirements=None,  # type: Optional[Iterable[str]]
         requirement_files=None,  # type: Optional[Iterable[str]]
         constraint_files=None,  # type: Optional[Iterable[str]]
@@ -562,10 +570,9 @@ class Pip(object):
         elif preserve_log:
             TRACER.log(
                 "The `pip {}` log is not being utilized, to see more `pip download` "
-                "details, re-run with more Pex verbosity (more `-v`s).".format(' '.join(
-                    shlex_quote(arg)
-                    for arg in resolve_cmd
-                )),
+                "details, re-run with more Pex verbosity (more `-v`s).".format(
+                    " ".join(shlex_quote(arg) for arg in resolve_cmd)
+                ),
                 V=ENV.PEX_VERBOSE,
             )
 

@@ -8,7 +8,9 @@ import functools
 import glob
 import hashlib
 import itertools
+import json
 import os
+import uuid
 import zipfile
 from abc import abstractmethod
 from collections import OrderedDict, defaultdict
@@ -20,7 +22,7 @@ from pex.common import safe_mkdir, safe_mkdtemp
 from pex.compatibility import url_unquote, urlparse
 from pex.dist_metadata import DistMetadata, Distribution, ProjectNameAndVersion, Requirement
 from pex.fingerprinted_distribution import FingerprintedDistribution
-from pex.jobs import Raise, SpawnedJob, execute_parallel
+from pex.jobs import Raise, Raise, SpawnedJob, execute_parallel
 from pex.network_configuration import NetworkConfiguration
 from pex.orderedset import OrderedSet
 from pex.pep_425 import CompatibilityTags
@@ -49,6 +51,7 @@ from pex.variables import ENV
 
 if TYPE_CHECKING:
     from typing import (
+        Dict,
         DefaultDict,
         Iterable,
         Iterator,
@@ -99,8 +102,59 @@ class DownloadRequest(object):
                 for target in self.targets:
                     yield BuildRequest.create(target=target, source_path=requirement.path)
 
+    def resolve_metadata_only_distributions(self, targets, dest=None, max_parallel_jobs=None):
+        # type: (targets.Targets, Optional[str], Optional[int]) -> Iterator[Dict]
+        if not self.requirements and not self.requirement_files:
+            # Nothing to resolve.
+            return
+
+        dest = dest or safe_mkdtemp(prefix="resolver_json.")
+
+
+        def spawn(dest, target):
+            # type: (str, targets.Target) -> SpawnedJob[Dict]
+            report_path = os.path.join(dest, 'metadata-{}.json'.format(uuid.uuid4().hex))
+            resolve_job = self._spawn_resolve(target, report_path)
+            return resolve_job
+        for report in execute_parallel(
+            targets.unique_targets(),
+            spawn_func=functools.partial(spawn, dest),
+            error_handler=Raise[Target, 'Dict'](Unsatisfiable),
+            max_jobs=max_parallel_jobs,
+        ):
+            yield report
+
+    def _spawn_resolve(self, target, report_path):
+        # type: (targets.Target, str) -> SpawnedJob[Dict]
+        resolve_job = get_pip(
+            interpreter=target.get_interpreter(),
+            version=self.pip_version,
+            resolver=self.resolver,
+        ).spawn_metadata_only_resolve_distributions(
+            report_path,
+            requirements=self.requirements,
+            requirement_files=self.requirement_files,
+            constraint_files=self.constraint_files,
+            allow_prereleases=self.allow_prereleases,
+            transitive=self.transitive,
+            target=target,
+            package_index_configuration=self.package_index_configuration,
+            build=self.build,
+            use_wheel=self.use_wheel,
+            prefer_older_binary=self.prefer_older_binary,
+            use_pep517=self.use_pep517,
+            build_isolation=self.build_isolation,
+            preserve_log=self.preserve_log,
+        )
+
+        def read_report(report_path):
+            # type: (str) -> Dict
+            with open(report_path, mode='rb') as report:
+                return json.load(report)
+        return SpawnedJob.and_then(resolve_job, lambda: read_report(report_path))
+
     def download_distributions(self, dest=None, max_parallel_jobs=None):
-        # type: (...) -> List[DownloadResult]
+        # type: (Optional[str], Optional[int]) -> List[DownloadResult]
         if not self.requirements and not self.requirement_files:
             # Nothing to resolve.
             return []
@@ -933,6 +987,70 @@ def _parse_reqs(
     return requirement_configuration.parse_requirements(network_configuration=network_configuration)
 
 
+def resolve_new(
+    targets=Targets(),  # type: Targets
+    requirements=None,  # type: Optional[Iterable[str]]
+    requirement_files=None,  # type: Optional[Iterable[str]]
+    constraint_files=None,  # type: Optional[Iterable[str]]
+    allow_prereleases=False,  # type: bool
+    transitive=True,  # type: bool
+    indexes=None,  # type: Optional[Sequence[str]]
+    find_links=None,  # type: Optional[Sequence[str]]
+    resolver_version=None,  # type: Optional[ResolverVersion.Value]
+    network_configuration=None,  # type: Optional[NetworkConfiguration]
+    password_entries=(),  # type: Iterable[PasswordEntry]
+    build=True,  # type: bool
+    use_wheel=True,  # type: bool
+    prefer_older_binary=False,  # type: bool
+    use_pep517=None,  # type: Optional[bool]
+    build_isolation=True,  # type: bool
+    compile=False,  # type: bool
+    max_parallel_jobs=None,  # type: Optional[int]
+    ignore_errors=False,  # type: bool
+    verify_wheels=True,  # type: bool
+    preserve_log=False,  # type: bool
+    pip_version=None,  # type: Optional[PipVersionValue]
+    resolver=None,  # type: Optional[Resolver]
+    fast_deps=True,  # type: bool
+):
+    # type: (...) -> Iterator[Dict]
+    direct_requirements = _parse_reqs(requirements, requirement_files, network_configuration)
+    package_index_configuration = PackageIndexConfiguration.create(
+        pip_version=pip_version,
+        resolver_version=resolver_version,
+        indexes=indexes,
+        find_links=find_links,
+        network_configuration=network_configuration,
+        password_entries=password_entries,
+        fast_deps=fast_deps,
+    )
+
+    with TRACER.timed(
+        "resolving metadata for  {}".format(targets)
+    ):
+        local_projects, resolve_reports = _resolve_internal(
+            targets=targets,
+            direct_requirements=direct_requirements,
+            requirements=requirements,
+            requirement_files=requirement_files,
+            constraint_files=constraint_files,
+            allow_prereleases=allow_prereleases,
+            transitive=transitive,
+            package_index_configuration=package_index_configuration,
+            build=build,
+            use_wheel=use_wheel,
+            prefer_older_binary=prefer_older_binary,
+            use_pep517=use_pep517,
+            build_isolation=build_isolation,
+            max_parallel_jobs=max_parallel_jobs,
+            preserve_log=preserve_log,
+            pip_version=pip_version,
+            resolver=resolver,
+        )
+        for report in resolve_reports:
+            yield report
+
+
 def resolve(
     targets=Targets(),  # type: Targets
     requirements=None,  # type: Optional[Iterable[str]]
@@ -957,7 +1075,7 @@ def resolve(
     preserve_log=False,  # type: bool
     pip_version=None,  # type: Optional[PipVersionValue]
     resolver=None,  # type: Optional[Resolver]
-    fast_deps=True,            # type: bool
+    fast_deps=True,  # type: bool
 ):
     # type: (...) -> Installed
     """Resolves all distributions needed to meet requirements for multiple distribution targets.
@@ -1097,6 +1215,59 @@ def resolve(
         )
     )
     return Installed(installed_distributions=installed_distributions)
+
+
+def _resolve_internal(
+    targets,  # type: Targets
+    direct_requirements,  # type: Iterable[ParsedRequirement]
+    requirements=None,  # type: Optional[Iterable[str]]
+    requirement_files=None,  # type: Optional[Iterable[str]]
+    constraint_files=None,  # type: Optional[Iterable[str]]
+    allow_prereleases=False,  # type: bool
+    transitive=True,  # type: bool
+    package_index_configuration=None,  # type: Optional[PackageIndexConfiguration]
+    build=True,  # type: bool
+    use_wheel=True,  # type: bool
+    prefer_older_binary=False,  # type: bool
+    use_pep517=None,  # type: Optional[bool]
+    build_isolation=True,  # type: bool
+    dest=None,  # type: Optional[str]
+    max_parallel_jobs=None,  # type: Optional[int]
+    observer=None,  # type: Optional[ResolveObserver]
+    preserve_log=False,  # type: bool
+    pip_version=None,  # type: Optional[PipVersionValue]
+    resolver=None,  # type: Optional[Resolver]
+):
+    # type: (...) -> Tuple[List[BuildRequest], SpawnedJob[Dict]]
+    unique_targets = targets.unique_targets()
+    download_request = DownloadRequest(
+        targets=unique_targets,
+        direct_requirements=direct_requirements,
+        requirements=requirements,
+        requirement_files=requirement_files,
+        constraint_files=constraint_files,
+        allow_prereleases=allow_prereleases,
+        transitive=transitive,
+        package_index_configuration=package_index_configuration,
+        build=build,
+        use_wheel=use_wheel,
+        prefer_older_binary=prefer_older_binary,
+        use_pep517=use_pep517,
+        build_isolation=build_isolation,
+        observer=observer,
+        preserve_log=preserve_log,
+        pip_version=pip_version,
+        resolver=resolver,
+    )
+
+    local_projects = list(download_request.iter_local_projects())
+
+    resolve_job = download_request.resolve_metadata_only_distributions(
+        targets,
+        dest=dest, max_parallel_jobs=max_parallel_jobs
+    )
+
+    return local_projects, resolve_job
 
 
 def _download_internal(
