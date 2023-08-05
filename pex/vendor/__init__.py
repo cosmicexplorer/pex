@@ -194,7 +194,7 @@ def iter_vendor_specs(filter_requires_python=False):
 
     # We shell out to pip at buildtime to resolve and install dependencies.
     # N.B.: We're currently using a patched version of Pip 20.3.4 housed at
-    # https://github.com/cosmicexplorer/pip/tree/bump-pip-version.
+    # https://github.com/cosmicexplorer/pip/tree/packagingcon-demo.
     # It has 1 patch:
     # 1.) https://github.com/pantsbuild/pip/commit/06f462537c981116c763c1ba40cf40e9dd461bcf
     #     The patch works around a bug in `pip download --constraint...` tracked at
@@ -204,7 +204,7 @@ def iter_vendor_specs(filter_requires_python=False):
     #     universal2 wheels.
     yield VendorSpec.git(
         repo="https://github.com/cosmicexplorer/pip",
-        commit="a3d7f406f3edc094fe1bc2f6d18205030aa007af",
+        commit="6ed9a566204dbbbb1a1b5af938ab31c2ba0a2444",
         project_name="pip",
         rewrite=False,
     )
