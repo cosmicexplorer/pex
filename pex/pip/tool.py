@@ -139,6 +139,7 @@ class PackageIndexConfiguration(object):
         find_links=None,  # type: Optional[Iterable[str]]
         network_configuration=None,  # type: Optional[NetworkConfiguration]
         password_entries=(),  # type: Iterable[PasswordEntry]
+        fast_deps=False,      # type: bool
     ):
         # type: (...) -> PackageIndexConfiguration
         resolver_version = resolver_version or ResolverVersion.default(pip_version)
@@ -159,6 +160,7 @@ class PackageIndexConfiguration(object):
             env=cls._calculate_env(network_configuration=network_configuration, isolated=isolated),
             isolated=isolated,
             password_entries=password_entries,
+            fast_deps=fast_deps,
         )
 
     def __init__(
@@ -170,6 +172,7 @@ class PackageIndexConfiguration(object):
         isolated,  # type: bool
         password_entries=(),  # type: Iterable[PasswordEntry]
         pip_version=None,  # type: Optional[PipVersionValue]
+        fast_deps=False,   # type: bool
     ):
         # type: (...) -> None
         self.resolver_version = resolver_version  # type: ResolverVersion.Value
@@ -179,6 +182,7 @@ class PackageIndexConfiguration(object):
         self.isolated = isolated  # type: bool
         self.password_entries = password_entries  # type: Iterable[PasswordEntry]
         self.pip_version = pip_version  # type: Optional[PipVersionValue]
+        self.fast_deps = fast_deps
 
 
 if TYPE_CHECKING:
@@ -244,6 +248,12 @@ class Pip(object):
             else ResolverVersion.default()
         )
 
+    @staticmethod
+    def _calculate_fast_deps_args(package_index_configuration=None):
+        # type: (Optional[PackageIndexConfiguration]) -> Iterator[str]
+        if package_index_configuration is not None and package_index_configuration.fast_deps:
+            yield "--use-feature=fast-deps"
+
     @classmethod
     def _calculate_resolver_version_args(
         cls,
@@ -297,6 +307,9 @@ class Pip(object):
             self._calculate_resolver_version_args(
                 python_interpreter, package_index_configuration=package_index_configuration
             )
+        )
+        pip_args.extend(
+            self._calculate_fast_deps_args(package_index_configuration=package_index_configuration),
         )
         if not package_index_configuration or package_index_configuration.isolated:
             # Don't read PIP_ environment variables or pip configuration files like

@@ -957,6 +957,7 @@ def resolve(
     preserve_log=False,  # type: bool
     pip_version=None,  # type: Optional[PipVersionValue]
     resolver=None,  # type: Optional[Resolver]
+    fast_deps=True,            # type: bool
 ):
     # type: (...) -> Installed
     """Resolves all distributions needed to meet requirements for multiple distribution targets.
@@ -1048,6 +1049,7 @@ def resolve(
         find_links=find_links,
         network_configuration=network_configuration,
         password_entries=password_entries,
+        fast_deps=fast_deps,
     )
     build_requests, download_results = _download_internal(
         targets=targets,
