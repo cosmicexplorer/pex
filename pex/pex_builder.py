@@ -8,6 +8,7 @@ import itertools
 import logging
 import os
 import shutil
+import zipfile
 
 from pex import pex_warnings
 from pex.atomic_directory import atomic_directory
@@ -18,9 +19,9 @@ from pex.common import (
     is_pyc_temporary_file,
     safe_copy,
     safe_delete,
+    safe_io_open,
     safe_mkdir,
     safe_mkdtemp,
-    safe_open,
 )
 from pex.compatibility import commonpath, to_bytes
 from pex.compiler import Compiler
@@ -36,10 +37,12 @@ from pex.pex_info import PexInfo
 from pex.sh_boot import create_sh_boot_script
 from pex.targets import Targets
 from pex.tracer import TRACER
-from pex.typing import TYPE_CHECKING
+from pex.typing import TYPE_CHECKING, cast
 from pex.util import CacheHelper
+from pex.ziputils import MergeableZipFile, buffered_zip_archive
 
 if TYPE_CHECKING:
+    import io
     from typing import ClassVar, Dict, Iterable, Iterator, Optional, Tuple
 
 
@@ -442,6 +445,7 @@ class PEXBuilder(object):
         self._header = header
 
     def _add_dist_dir(self, path, dist_name, fingerprint=None):
+        # type: (str, str, Optional[str]) -> str
         target_dir = os.path.join(self._pex_info.internal_cache, dist_name)
         if self._copy_mode == CopyMode.SYMLINK:
             self._copy_or_link(path, target_dir, label=dist_name)
@@ -558,6 +562,7 @@ class PEXBuilder(object):
         elif self._copy_mode == CopyMode.SYMLINK:
             self._chroot.symlink(src, dst, label)
         else:
+            assert self._copy_mode == CopyMode.LINK
             self._chroot.link(src, dst, label)
 
     def _prepare_bootstrap(self):
@@ -634,12 +639,13 @@ class PEXBuilder(object):
         deterministic_timestamp=False,  # type: bool
         layout=Layout.ZIPAPP,  # type: Layout.Value
         compress=True,  # type: bool
+        cache_dists=None,  # type: Optional[bool]
     ):
         # type: (...) -> None
         """Package the PEX application.
 
         By default, the PEX is packaged as a zipapp for ease of shipping as a single file, but it
-        can also be packaged in spread mode for efficiency of syncing over the network
+        can also be packaged in a packed layout for efficiency of syncing over the network
         incrementally.
 
         :param path: The path where the PEX should be stored.
@@ -648,6 +654,8 @@ class PEXBuilder(object):
         :param layout: The layout to use for the PEX.
         :param compress: Whether to compress zip entries when building to a layout that uses zip
                          files.
+        :param cache_dists: For ``Layout.PACKED`` and ``Layout.ZIPAPP``, whether to zip up each dist
+                            into the pex cache. Otherwise ignored.
 
         If the PEXBuilder is not yet frozen, it will be frozen by ``build``.  This renders the
         PEXBuilder immutable.
@@ -665,17 +673,34 @@ class PEXBuilder(object):
             else:
                 shutil.rmtree(tmp_pex, True)
 
+        if not compress:
+            if cache_dists is True:
+                pex_warnings.warn(
+                    "--cache-dists provides very little speedup when used with --no-compress, "
+                    "while generating extremely large cache entries."
+                )
+
         if layout == Layout.LOOSE:
             shutil.copytree(self.path(), tmp_pex)
         elif layout == Layout.PACKED:
+            # Default to enabling the dist cache for packed layout.
+            if cache_dists is None:
+                cache_dists = True
             self._build_packedapp(
                 dirname=tmp_pex,
                 deterministic_timestamp=deterministic_timestamp,
                 compress=compress,
+                cache_dists=cache_dists,
             )
         else:
+            # Default to disabling the dist cache for zipapps.
+            if cache_dists is None:
+                cache_dists = False
             self._build_zipapp(
-                filename=tmp_pex, deterministic_timestamp=deterministic_timestamp, compress=compress
+                filename=tmp_pex,
+                deterministic_timestamp=deterministic_timestamp,
+                compress=compress,
+                cache_dists=cache_dists,
             )
 
         if os.path.isdir(path):
@@ -751,20 +776,35 @@ class PEXBuilder(object):
         yield "executable"
 
     def _setup_pex_info(self):
-        # type: () -> PexInfo
+        # type: () -> Tuple[PexInfo, str]
         pex_info = self._pex_info.copy()
         pex_info.update(PexInfo.from_env())
-        return pex_info
+
+        bootstrap_hash = pex_info.bootstrap_hash
+        if bootstrap_hash is None:
+            raise AssertionError(
+                "Expected bootstrap_hash to be populated for {}.".format(self._pex_info)
+            )
+
+        return (pex_info, bootstrap_hash)
+
+    @staticmethod
+    def _cache_root(pex_info, cache_dists):
+        # type: (PexInfo, bool) -> str
+        if cache_dists:
+            return pex_info.pex_root
+        return safe_mkdtemp(suffix="pex-zipped-dists")
 
     def _build_packedapp(
         self,
         dirname,  # type: str
         deterministic_timestamp=False,  # type: bool
         compress=True,  # type: bool
+        cache_dists=True,  # type: bool
     ):
         # type: (...) -> None
-
-        pex_info = self._setup_pex_info()
+        pex_info, bootstrap_hash = self._setup_pex_info()
+        cache_root = self._cache_root(pex_info, cache_dists)
 
         # Include user sources, PEX-INFO and __main__ as loose files in src/.
         with TRACER.timed("copying over uncached sources", V=9):
@@ -779,63 +819,214 @@ class PEXBuilder(object):
                     safe_mkdir(os.path.dirname(dest))
                     safe_copy(os.path.realpath(os.path.join(self._chroot.chroot, f)), dest)
 
-        # Pex historically only supported compressed zips in packed layout, so we don't disturb the
-        # old cache structure for those zips and instead just use a subdir for un-compressed zips.
-        # This works for our two zip caches (we'll have no collisions with legacy compressed zips)
-        # since the bootstrap zip has a known name that is not "un-compressed" and "un-compressed"
-        # is not a valid wheel name either.
-        def zip_cache_dir(path):
-            # type: (str) -> str
-            if compress:
-                return path
-            return os.path.join(path, "un-compressed")
-
         # Zip up the bootstrap which is constant for a given version of Pex.
-        bootstrap_hash = pex_info.bootstrap_hash
-        if bootstrap_hash is None:
-            raise AssertionError(
-                "Expected bootstrap_hash to be populated for {}.".format(self._pex_info)
-            )
-        cached_bootstrap_zip_dir = zip_cache_dir(
-            os.path.join(pex_info.pex_root, "bootstrap_zips", bootstrap_hash)
+        cached_bootstrap_zip = self._get_or_insert_into_bootstrap_cache(
+            cache_root,
+            pex_info,
+            bootstrap_hash,
+            compress=compress,
         )
-        with atomic_directory(cached_bootstrap_zip_dir) as atomic_bootstrap_zip_dir:
-            if not atomic_bootstrap_zip_dir.is_finalized():
-                self._chroot.zip(
-                    os.path.join(atomic_bootstrap_zip_dir.work_dir, pex_info.bootstrap),
-                    deterministic_timestamp=deterministic_timestamp,
-                    exclude_file=is_pyc_temporary_file,
-                    strip_prefix=pex_info.bootstrap,
-                    labels=("bootstrap",),
-                    compress=compress,
-                )
-        safe_copy(
-            os.path.join(cached_bootstrap_zip_dir, pex_info.bootstrap),
-            os.path.join(dirname, pex_info.bootstrap),
-        )
+        safe_copy(cached_bootstrap_zip, os.path.join(dirname, pex_info.bootstrap))
 
         # Zip up each installed wheel chroot, which is constant for a given version of a
         # wheel.
         if pex_info.distributions:
             internal_cache = os.path.join(dirname, pex_info.internal_cache)
             os.mkdir(internal_cache)
-            for location, fingerprint in pex_info.distributions.items():
-                cached_installed_wheel_zip_dir = zip_cache_dir(
-                    os.path.join(pex_info.pex_root, "packed_wheels", fingerprint)
+            for dist_label, fingerprint in pex_info.distributions.items():
+                cached_packed_zip = self._get_or_insert_into_packed_wheel_cache(
+                    cache_root,
+                    pex_info,
+                    dist_label,
+                    fingerprint,
+                    compress=compress,
                 )
-                with atomic_directory(cached_installed_wheel_zip_dir) as atomic_zip_dir:
-                    if not atomic_zip_dir.is_finalized():
-                        self._chroot.zip(
-                            os.path.join(atomic_zip_dir.work_dir, location),
-                            deterministic_timestamp=deterministic_timestamp,
-                            exclude_file=is_pyc_temporary_file,
-                            strip_prefix=os.path.join(pex_info.internal_cache, location),
-                            labels=(location,),
-                            compress=compress,
-                        )
-                safe_copy(
-                    os.path.join(cached_installed_wheel_zip_dir, location),
-                    os.path.join(internal_cache, location),
+                safe_copy(cached_packed_zip, os.path.join(internal_cache, dist_label))
+
+    @staticmethod
+    def get_zip_cache_subdir(base_path, compress):
+        # type: (str, bool) -> str
+        """Get the cache location for the entry at `base_path` depending on the value of `compress`.
+
+        Pex historically only supported compressed zips in packed layout, so we don't disturb the
+        old cache structure for those zips and instead just use a subdir for un-compressed zips.
+        This works for our two zip caches (we'll have no collisions with legacy compressed zips)
+        since the bootstrap zip has a known name that is not "un-compressed" and "un-compressed"
+        is not a valid wheel name either.
+        """
+        if compress:
+            return base_path
+        return os.path.join(base_path, "un-compressed")
+
+    def _get_or_insert_into_bootstrap_cache(
+        self,
+        cache_root,  # type: str
+        pex_info,  # type: PexInfo
+        bootstrap_hash,  # type: str
+        compress,  # type: bool
+    ):
+        # type: (...) -> str
+        cached_bootstrap_zip_dir = self.get_zip_cache_subdir(
+            os.path.join(cache_root, "bootstrap_zips", bootstrap_hash),
+            compress=compress,
+        )
+        with atomic_directory(cached_bootstrap_zip_dir) as atomic_bootstrap_zip_dir:
+            if not atomic_bootstrap_zip_dir.is_finalized():
+                with TRACER.timed("generating bootstrap cache for hash {}".format(bootstrap_hash)):
+                    self._chroot.zip(
+                        os.path.join(atomic_bootstrap_zip_dir.work_dir, pex_info.bootstrap),
+                        deterministic_timestamp=True,
+                        exclude_file=is_pyc_temporary_file,
+                        strip_prefix=pex_info.bootstrap,
+                        labels=list(self.iter_bootstrap_libs_labels()),
+                        compress=compress,
+                    )
+        return os.path.join(cached_bootstrap_zip_dir, pex_info.bootstrap)
+
+    def _get_or_insert_into_packed_wheel_cache(
+        self,
+        cache_root,  # type: str
+        pex_info,  # type: PexInfo
+        dist_label,  # type: str
+        fingerprint,  # type: str
+        compress,  # type: bool
+    ):
+        # type: (...) -> str
+        cached_installed_wheel_zip_dir = self.get_zip_cache_subdir(
+            os.path.join(cache_root, "packed_wheels", fingerprint),
+            compress=compress,
+        )
+        with atomic_directory(cached_installed_wheel_zip_dir) as atomic_zip_dir:
+            if not atomic_zip_dir.is_finalized():
+                with TRACER.timed("generating packed wheel cache for {}".format(dist_label)):
+                    self._chroot.zip(
+                        os.path.join(atomic_zip_dir.work_dir, dist_label),
+                        # These will be getting served from a cache regardless of the value of
+                        # deterministic_timestamp in the caller, so best to explicitly mark them as
+                        # synthetic in some way to avoid timestamps changing depending on the
+                        # cache contents.
+                        deterministic_timestamp=True,
+                        exclude_file=is_pyc_temporary_file,
+                        strip_prefix=os.path.join(pex_info.internal_cache, dist_label),
+                        labels=(dist_label,),
+                        compress=compress,
+                    )
+        return os.path.join(cached_installed_wheel_zip_dir, dist_label)
+
+    def _build_zipapp_without_cached_dists(
+        self,
+        pexfile,  # type: io.IOBase
+        deterministic_timestamp,  # type: bool
+        compress,  # type: bool
+    ):
+        # type: (...) -> None
+        """Write the chroot into an executable zipapp, appending to the given file handle."""
+        pex_info, _ = self._setup_pex_info()
+        self._chroot.zip(
+            pexfile,
+            mode="a",
+            deterministic_timestamp=True,
+            # When configured with a `copy_mode` of `CopyMode.SYMLINK`, we symlink
+            # distributions as pointers to installed wheel directories in
+            # ~/.pex/installed_wheels/... Since those installed wheels reside in
+            # a shared cache, they can be in-use by other processes and so their code
+            # may be in the process of being bytecode compiled as we attempt to zip up
+            # our chroot. Bytecode compilation produces ephemeral temporary pyc files
+            # that we should avoid copying since they are useless and inherently racy.
+            exclude_file=is_pyc_temporary_file,
+            compress=compress,
+            # Iterate over all the files in the Chroot, including descending into symlinks to
+            # unpacked third-party dists in the pex cache.
+            labels=list(self.iter_zipapp_labels(pex_info)),
+        )
+
+    def _build_zipapp_with_cached_dists(
+        self,
+        pexfile,  # type: io.BufferedRandom
+        deterministic_timestamp,  # type: bool
+        compress,  # type: bool
+    ):
+        # type: (...) -> None
+        """Engage our hacky solution to reuse the same caches as for --layout packed.
+
+        This reads from a single compressed file per cached resource instead of
+        traversing any directory trees. If compress=True, this will also significantly
+        reduce the total number of bytes to read and avoid a lot of single-threaded
+        computation, because the compressed entries are simply copied over as-is.
+
+        Note that these cached zips are created in the --layout packed format, without
+        the .bootstrap/ or .deps/ prefixes we need to form a proper Pex zipapp
+        layout. Our zip file merging solution edits each entry's .filename with the
+        appropriate prefix, but we will still need to generate intermediate directory
+        entries before adding the prefixed files in order to unzip correctly.
+        """
+        pex_info, bootstrap_hash = self._setup_pex_info()
+        cache_root = self._cache_root(pex_info, True)
+
+        with MergeableZipFile(pexfile, mode="a") as zf:
+            # (1) Add a subdirectory for each resolved dist.
+            with TRACER.timed("adding dependencies", V=9):
+                # Generate ".deps/".
+                zf.mkdir(pex_info.internal_cache)
+
+                # Sort the dict keys for a deterministic output. This also ensures that the
+                # contents of the .deps/ subdirectory are lexicographically sorted, which
+                # corresponds to the order they would have been added to the zip without
+                # any caching.
+                for dist_label in sorted(pex_info.distributions.keys()):
+                    fingerprint = pex_info.distributions[dist_label]
+
+                    dist_prefix = os.path.join(pex_info.internal_cache, dist_label)
+                    # Generate e.g. ".deps/Keras-2.4.3-py2.py3-none-any.whl/".
+                    zf.mkdir(dist_prefix)
+
+                    cached_packed_zip = self._get_or_insert_into_packed_wheel_cache(
+                        cache_root,
+                        pex_info,
+                        dist_label,
+                        fingerprint,
+                        compress=compress,
+                    )
+                    with buffered_zip_archive(cached_packed_zip) as packed_zf:
+                        zf.merge_archive(packed_zf, name_prefix=dist_prefix)
+
+            # (2) Zip up uncached user sources.
+            with TRACER.timed("zipping up user sources", V=9):
+                self._chroot.zip(
+                    zf,
+                    deterministic_timestamp=deterministic_timestamp,
+                    compress=compress,
+                    labels=list(self.iter_direct_source_labels()),
+                )
+
+            # (3) Add the single bootstrap dir.
+            with TRACER.timed("adding bootstrap dir", V=9):
+                # Generate ".bootstrap/".
+                zf.mkdir(pex_info.bootstrap)
+                cached_bootstrap_zip = self._get_or_insert_into_bootstrap_cache(
+                    cache_root,
+                    pex_info,
+                    bootstrap_hash,
+                    compress=compress,
+                )
+                with buffered_zip_archive(cached_bootstrap_zip) as bootstrap_zf:
+                    zf.merge_archive(bootstrap_zf, name_prefix=pex_info.bootstrap)
+
+            # (4) Add generated pex info. This includes __main__.py, which is what the python
+            #     interpreter first looks for when executing a zipapp. We make sure it's near the
+            #     central directory records at the end of the file, so that after the interpreter
+            #     parses the central directory, it doesn't need to seek very far to find the file
+            #     to execute.
+            with TRACER.timed("zipping up generated pex info", V=9):
+                generated_pex_labels = [
+                    self.iter_metadata_labels(),
+                    self.iter_bootstrap_script_labels(),
+                ]
+                self._chroot.zip(
+                    zf,
+                    deterministic_timestamp=deterministic_timestamp,
+                    compress=compress,
+                    labels=list(itertools.chain.from_iterable(generated_pex_labels)),
                 )
 
     @classmethod
@@ -874,27 +1065,34 @@ class PEXBuilder(object):
         filename,  # type: str
         deterministic_timestamp=False,  # type: bool
         compress=True,  # type: bool
+        cache_dists=False,  # type: bool
     ):
         # type: (...) -> None
-        with safe_open(filename, "wb") as pexfile:
-            assert os.path.getsize(pexfile.name) == 0
-            pexfile.write(to_bytes("{}\n".format(self._shebang)))
-            if self._header:
-                pexfile.write(to_bytes(self._header))
         with TRACER.timed("Zipping PEX file."):
-            self._chroot.zip(
-                filename,
-                mode="a",
-                deterministic_timestamp=deterministic_timestamp,
-                # When configured with a `copy_mode` of `CopyMode.SYMLINK`, we symlink distributions
-                # as pointers to installed wheel directories in ~/.pex/installed_wheels/... Since
-                # those installed wheels reside in a shared cache, they can be in-use by other
-                # processes and so their code may be in the process of being bytecode compiled as we
-                # attempt to zip up our chroot. Bytecode compilation produces ephemeral temporary
-                # pyc files that we should avoid copying since they are useless and inherently
-                # racy.
-                exclude_file=is_pyc_temporary_file,
-                compress=compress,
-                labels=list(self.iter_zipapp_labels(self._setup_pex_info())),
-            )
+            # We will be reusing the same file handle to wrap with ZipFile, which needs to be able
+            # to read the file contents when instantiated, so it can check for existing zip
+            # file data. Hence, we open with "w+b".
+            with safe_io_open(filename, "w+b") as pexfile:
+                # Write shebang line and any header script to a non-zip file handle.
+                pexfile.write(to_bytes("{}\n".format(self._shebang)))
+                if self._header:
+                    pexfile.write(to_bytes(self._header))
+
+                # Reuse the file handle to zip into. This isn't necessary (we could close and reopen
+                # it), but it avoids unnecessarily flushing to disk. When we wrap an existing handle
+                # like this, the ZipFile class will re-parse the central directory records at the
+                # end of the file and then reset the cursor to the beginning of the central
+                # directory records.
+                if cache_dists:
+                    self._build_zipapp_with_cached_dists(
+                        cast("io.BufferedRandom", pexfile),
+                        deterministic_timestamp=deterministic_timestamp,
+                        compress=compress,
+                    )
+                else:
+                    self._build_zipapp_without_cached_dists(
+                        pexfile,
+                        deterministic_timestamp=deterministic_timestamp,
+                        compress=compress,
+                    )
         chmod_plus_x(filename)
