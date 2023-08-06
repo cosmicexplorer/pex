@@ -1,51 +1,54 @@
 """Lazy ZIP over HTTP"""
 
-__all__ = ['HTTPRangeRequestUnsupported', 'dist_from_wheel_url']
+from __future__ import annotations
 
+__all__ = ["HTTPRangeRequestUnsupported", "dist_from_wheel_url"]
+
+import logging
 from bisect import bisect_left, bisect_right
 from contextlib import contextmanager
 from tempfile import NamedTemporaryFile
-from zipfile import BadZipfile, ZipFile
+from typing import Any, Dict, Generator, Iterator, List, Optional, Tuple
+from zipfile import BadZipFile, ZipFile
 
-from pip._vendor.requests.models import CONTENT_CHUNK_SIZE
-from pip._vendor.six.moves import range
+from pip._vendor.packaging.utils import canonicalize_name
+from pip._vendor.requests.models import CONTENT_CHUNK_SIZE, HTTPError, Response
 
-from pip._internal.network.utils import HEADERS, raise_for_status, response_chunks
-from pip._internal.utils.typing import MYPY_CHECK_RUNNING
-from pip._internal.utils.wheel import pkg_resources_distribution_for_wheel
+from pip._internal.exceptions import InvalidWheel
+from pip._internal.metadata import BaseDistribution, MemoryWheel, get_wheel_distribution
+from pip._internal.network.session import PipSession as Session
+from pip._internal.network.utils import HEADERS
 
-if MYPY_CHECK_RUNNING:
-    from typing import Any, Dict, Iterator, List, Optional, Tuple
-
-    from pip._vendor.pkg_resources import Distribution
-    from pip._vendor.requests.models import Response
-
-    from pip._internal.network.session import PipSession
+log = logging.getLogger(__name__)
 
 
 class HTTPRangeRequestUnsupported(Exception):
     pass
 
 
-def dist_from_wheel_url(name, url, session):
-    # type: (str, str, PipSession) -> Distribution
-    """Return a pkg_resources.Distribution from the given wheel URL.
+def dist_from_wheel_url(name: str, url: str, session: Session) -> BaseDistribution:
+    """Return a distribution object from the given wheel URL.
 
-    This uses HTTP range requests to only fetch the potion of the wheel
+    This uses HTTP range requests to only fetch the portion of the wheel
     containing metadata, just enough for the object to be constructed.
     If such requests are not supported, HTTPRangeRequestUnsupported
     is raised.
     """
-    with LazyZipOverHTTP(url, session) as wheel:
-        # For read-only ZIP files, ZipFile only needs methods read,
-        # seek, seekable and tell, not the whole IO protocol.
-        zip_file = ZipFile(wheel)  # type: ignore
-        # After context manager exit, wheel.name
-        # is an invalid file by intention.
-        return pkg_resources_distribution_for_wheel(zip_file, name, wheel.name)
+    try:
+        with LazyZipOverHTTP(url, session) as zf:
+            zf.prefetch_dist_info()
+
+            # For read-only ZIP files, ZipFile only needs methods read,
+            # seek, seekable and tell, not the whole IO protocol.
+            wheel = MemoryWheel(zf.name, zf)  # type: ignore
+            # After context manager exit, wheel.name
+            # is an invalid file by intention.
+            return get_wheel_distribution(wheel, canonicalize_name(name))
+    except BadZipfile:
+        raise InvalidWheel(url, name)
 
 
-class LazyZipOverHTTP(object):
+class LazyZipOverHTTP:
     """File-like object mapped to a ZIP file over HTTP.
 
     This uses HTTP range requests to lazily fetch the file's content,
@@ -54,71 +57,105 @@ class LazyZipOverHTTP(object):
     during initialization.
     """
 
-    def __init__(self, url, session, chunk_size=CONTENT_CHUNK_SIZE):
-        # type: (str, PipSession, int) -> None
-        head = session.head(url, headers=HEADERS)
-        raise_for_status(head)
-        assert head.status_code == 200
+    def __init__(
+        self, url: str, session: Session, chunk_size: int = CONTENT_CHUNK_SIZE
+    ) -> None:
+
+        # if CONTENT_CHUNK_SIZE is bigger than the file:
+        # In [8]: response.headers["Content-Range"]
+        # Out[8]: 'bytes 0-3133374/3133375'
+
+        self._request_count = 0
+
         self._session, self._url, self._chunk_size = session, url, chunk_size
-        self._length = int(head.headers['Content-Length'])
+
+        # initial range request for the end of the file
+        try:
+            tail = self._stream_response(start="", end=CONTENT_CHUNK_SIZE)
+        except HTTPError as e:
+            if e.response.status_code != 416:
+                raise
+
+            # The 416 response message contains a Content-Range indicating an
+            # unsatisfied range (that is a '*') followed by a '/' and the current
+            # length of the resource. E.g. Content-Range: bytes */12777
+            content_length = int(e.response.headers["content-range"].rsplit("/", 1)[-1])
+            tail = self._stream_response(start=0, end=content_length)
+
+        # e.g. {'accept-ranges': 'bytes', 'content-length': '10240',
+        # 'content-range': 'bytes 12824-23063/23064', 'last-modified': 'Sat, 16
+        # Apr 2022 13:03:02 GMT', 'date': 'Thu, 21 Apr 2022 11:34:04 GMT'}
+
+        if tail.status_code != 206:
+            if (
+                tail.status_code == 200
+                and int(tail.headers["content-length"]) <= CONTENT_CHUNK_SIZE
+            ):
+                # small file
+                content_length = len(tail.content)
+                tail.headers["content-range"] = f"0-{content_length-1}/{content_length}"
+            else:
+                raise HTTPRangeRequestUnsupported("range request is not supported")
+
+        # lowercase content-range to support s3
+        self._length = int(tail.headers["content-range"].partition("/")[-1])
         self._file = NamedTemporaryFile()
         self.truncate(self._length)
-        self._left = []  # type: List[int]
-        self._right = []  # type: List[int]
-        if 'bytes' not in head.headers.get('Accept-Ranges', 'none'):
-            raise HTTPRangeRequestUnsupported('range request is not supported')
-        self._check_zip()
+
+        # length is also in Content-Length and Content-Range header
+        with self._stay():
+            content_length = int(tail.headers["content-length"])
+            if hasattr(tail, "content"):
+                assert content_length == len(tail.content)
+            self.seek(self._length - content_length)
+            for chunk in tail.iter_content(self._chunk_size):
+                self._file.write(chunk)
+        self._left: list[int] = [self._length - content_length]
+        self._right: list[int] = [self._length - 1]
 
     @property
-    def mode(self):
-        # type: () -> str
+    def mode(self) -> str:
         """Opening mode, which is always rb."""
-        return 'rb'
+        return "rb"
 
     @property
-    def name(self):
-        # type: () -> str
+    def name(self) -> str:
         """Path to the underlying file."""
         return self._file.name
 
-    def seekable(self):
-        # type: () -> bool
+    def seekable(self) -> bool:
         """Return whether random access is supported, which is True."""
         return True
 
-    def close(self):
-        # type: () -> None
+    def close(self) -> None:
         """Close the file."""
         self._file.close()
 
     @property
-    def closed(self):
-        # type: () -> bool
+    def closed(self) -> bool:
         """Whether the file is closed."""
         return self._file.closed
 
-    def read(self, size=-1):
-        # type: (int) -> bytes
+    def read(self, size: int = -1) -> bytes:
         """Read up to size bytes from the object and return them.
 
         As a convenience, if size is unspecified or -1,
         all bytes until EOF are returned.  Fewer than
         size bytes may be returned if EOF is reached.
         """
-        download_size = max(size, self._chunk_size)
+        # BUG does not download correctly if size is unspecified
+        download_size = size
         start, length = self.tell(), self._length
-        stop = length if size < 0 else min(start+download_size, length)
-        start = max(0, stop-download_size)
-        self._download(start, stop-1)
+        stop = length if size < 0 else min(start + download_size, length)
+        start = max(0, stop - download_size)
+        self._download(start, stop - 1)
         return self._file.read(size)
 
-    def readable(self):
-        # type: () -> bool
+    def readable(self) -> bool:
         """Return whether the file is readable, which is True."""
         return True
 
-    def seek(self, offset, whence=0):
-        # type: (int, int) -> int
+    def seek(self, offset: int, whence: int = 0) -> int:
         """Change stream position and return the new absolute position.
 
         Seek to offset relative position indicated by whence:
@@ -128,13 +165,11 @@ class LazyZipOverHTTP(object):
         """
         return self._file.seek(offset, whence)
 
-    def tell(self):
-        # type: () -> int
-        """Return the current possition."""
+    def tell(self) -> int:
+        """Return the current position."""
         return self._file.tell()
 
-    def truncate(self, size=None):
-        # type: (Optional[int]) -> int
+    def truncate(self, size: int | None = None) -> int:
         """Resize the stream to the given size in bytes.
 
         If size is unspecified resize to the current position.
@@ -144,23 +179,20 @@ class LazyZipOverHTTP(object):
         """
         return self._file.truncate(size)
 
-    def writable(self):
-        # type: () -> bool
+    def writable(self) -> bool:
         """Return False."""
         return False
 
-    def __enter__(self):
-        # type: () -> LazyZipOverHTTP
+    def __enter__(self) -> LazyZipOverHTTP:
         self._file.__enter__()
         return self
 
-    def __exit__(self, *exc):
-        # type: (*Any) -> Optional[bool]
-        return self._file.__exit__(*exc)
+    def __exit__(self, *exc: Any) -> bool | None:
+        print(self._request_count, "requests to fetch metadata from", self._url[107:])
+        return self._file.__exit__(*exc)  # type: ignore
 
     @contextmanager
-    def _stay(self):
-        # type: ()-> Iterator[None]
+    def _stay(self) -> Iterator[None]:
         """Return a context manager keeping the position.
 
         At the end of the block, seek back to original position.
@@ -171,8 +203,7 @@ class LazyZipOverHTTP(object):
         finally:
             self.seek(pos)
 
-    def _check_zip(self):
-        # type: () -> None
+    def _check_zip(self) -> None:
         """Check and download until the file is a valid ZIP."""
         end = self._length - 1
         for start in reversed(range(0, end, self._chunk_size)):
@@ -182,22 +213,32 @@ class LazyZipOverHTTP(object):
                     # For read-only ZIP files, ZipFile only needs
                     # methods read, seek, seekable and tell.
                     ZipFile(self)  # type: ignore
-                except BadZipfile:
+                except BadZipFile:
                     pass
                 else:
                     break
 
-    def _stream_response(self, start, end, base_headers=HEADERS):
-        # type: (int, int, Dict[str, str]) -> Response
-        """Return HTTP response to a range request from start to end."""
-        headers = base_headers.copy()
-        headers['Range'] = 'bytes={}-{}'.format(start, end)
-        # TODO: Get range requests to be correctly cached
-        headers['Cache-Control'] = 'no-cache'
-        return self._session.get(self._url, headers=headers, stream=True)
+    def _stream_response(
+        self, start: int | str, end: int, base_headers: dict[str, str] = HEADERS
+    ) -> Response:
+        """Return HTTP response to a range request from start to end.
 
-    def _merge(self, start, end, left, right):
-        # type: (int, int, int, int) -> Iterator[Tuple[int, int]]
+        :param start: if "", request ``end` bytes from end of file."""
+        headers = base_headers.copy()
+        headers["Range"] = f"bytes={start}-{end}"
+        log.debug("%s", headers["Range"])
+        # TODO: Get range requests to be correctly cached
+        headers["Cache-Control"] = "no-cache"
+        # TODO: If-Match (etag) to detect file changed during fetch would be a
+        # good addition to HEADERS
+        self._request_count += 1
+        response = self._session.get(self._url, headers=headers, stream=True)
+        response.raise_for_status()
+        return response
+
+    def _merge(
+        self, start: int, end: int, left: int, right: int
+    ) -> Iterator[tuple[int, int]]:
         """Return an iterator of intervals to be fetched.
 
         Args:
@@ -207,25 +248,74 @@ class LazyZipOverHTTP(object):
             right (int): Index after last overlapping downloaded data
         """
         lslice, rslice = self._left[left:right], self._right[left:right]
-        i = start = min([start]+lslice[:1])
-        end = max([end]+rslice[-1:])
+        i = start = min([start] + lslice[:1])
+        end = max([end] + rslice[-1:])
         for j, k in zip(lslice, rslice):
             if j > i:
-                yield i, j-1
+                yield i, j - 1
             i = k + 1
         if i <= end:
             yield i, end
         self._left[left:right], self._right[left:right] = [start], [end]
 
-    def _download(self, start, end):
-        # type: (int, int) -> None
+    def _download(self, start: int, end: int) -> None:
         """Download bytes from start to end inclusively."""
         with self._stay():
             left = bisect_left(self._right, start)
             right = bisect_right(self._left, end)
             for start, end in self._merge(start, end, left, right):
                 response = self._stream_response(start, end)
-                response.raise_for_status()
                 self.seek(start)
-                for chunk in response_chunks(response, self._chunk_size):
+                for chunk in response.iter_content(self._chunk_size):
                     self._file.write(chunk)
+
+    def prefetch(self, target_file: str) -> None:
+        """
+        Prefetch a specific file from the remote ZIP in one request.
+        """
+        with self._stay():  # not strictly necessary
+            # try to read entire conda info in one request
+            zf = ZipFile(self)  # type: ignore
+            infolist = zf.infolist()
+            for i, info in enumerate(infolist):
+                if info.filename == target_file:
+                    # could be incorrect if zipfile was concatenated to another
+                    # file (not likely for .conda)
+                    start = info.header_offset
+                    try:
+                        end = infolist[i + 1].header_offset
+                        # or info.header_offset
+                        # + len(info.filename)
+                        # + len(info.extra)
+                        # + info.compress_size
+                        # (unless Zip64)
+                    except IndexError:
+                        end = zf.start_dir
+                    self.seek(start)
+                    self.read(end - start)
+                    log.debug(
+                        "prefetch %s-%s",
+                        info.header_offset,
+                        end,
+                    )
+                    break
+            else:
+                log.debug("no zip prefetch")
+
+    def prefetch_dist_info(self) -> None:
+        """
+        Read contents of entire dist-info section of wheel.
+
+        pip wants to read WHEEL and METADATA.
+        """
+        with self._stay():
+            zf = ZipFile(self)  # type: ignore
+            infolist = zf.infolist()
+            for info in infolist:
+                # should be (wheel filename without extension etc) + (.dist-info/)
+                if ".dist-info/" in info.filename:
+                    start = info.header_offset
+                    end = zf.start_dir
+                    self.seek(start)
+                    self.read(end - start)
+                    break
