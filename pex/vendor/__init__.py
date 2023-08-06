@@ -193,7 +193,7 @@ def iter_vendor_specs(filter_requires_python=False):
     yield VendorSpec.pinned("toml", "0.10.2")
 
     # We shell out to pip at buildtime to resolve and install dependencies.
-    # N.B.: We're currently using a patched version of Pip 20.3.4 housed at
+    # N.B.: We're currently using a patched version of Pip 23.3.dev0 housed at
     # https://github.com/cosmicexplorer/pip/tree/packagingcon-demo.
     # It has 1 patch:
     # 1.) https://github.com/pantsbuild/pip/commit/06f462537c981116c763c1ba40cf40e9dd461bcf
@@ -204,7 +204,7 @@ def iter_vendor_specs(filter_requires_python=False):
     #     universal2 wheels.
     yield VendorSpec.git(
         repo="https://github.com/cosmicexplorer/pip",
-        commit="6ed9a566204dbbbb1a1b5af938ab31c2ba0a2444",
+        commit="08dafbb2091b5d325772be89df1790c47a5930f8",
         project_name="pip",
         rewrite=False,
     )
