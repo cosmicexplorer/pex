@@ -82,6 +82,11 @@ class Job(object):
         finally:
             self._finalize_job()
 
+    def read_output(self):
+        # type: () -> Iterator[str]
+        for line in self._process.stdout.lines():
+            yield line
+
     def communicate(self, input=None):
         # type: (Optional[bytes]) -> Tuple[bytes, bytes]
         """Communicates with the job sending any input data to stdin and collecting stdout and
@@ -159,6 +164,11 @@ class Job(object):
 class SpawnedJob(Generic["_T"]):
     """A handle to a spawned :class:`Job` and its associated result."""
 
+    @property
+    def job(self):
+        # type: () -> Job
+        raise NotImplementedError()
+
     @classmethod
     def completed(cls, result):
         # type: (_T) -> SpawnedJob[_T]
@@ -217,6 +227,11 @@ class SpawnedJob(Generic["_T"]):
         """
 
         class AndThen(SpawnedJob):
+            @property
+            def job(self):
+                # type: () -> Job
+                return job
+
             def await_result(self):
                 # type: () -> _T
                 job.wait()
